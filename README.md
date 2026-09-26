@@ -491,7 +491,5 @@ attached as the `coverage` artifact.
 
 ## Follow-ups
 
-- Swap the embedding stage for a [Geneva](https://lancedb.com/docs/geneva/) UDF,
-  so re-embedding with a new model is a column backfill rather than a re-ingest.
 - Ingest the camera sweeps too (12 Hz instead of 2 Hz), for a denser
   near-duplicate problem. They carry no annotations.
