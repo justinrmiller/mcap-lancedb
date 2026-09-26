@@ -1,9 +1,10 @@
-# This project lives in a monorepo, and pre-commit always runs from the git
-# root. Every hook is therefore scoped to mcap-lancedb/, and the uv hooks point
-# at this directory explicitly. Run it from here:
+# Install the git hook once with:
+#
+#   uv run --group dev pre-commit install
+#
+# and run every hook across the repo with:
 #
 #   uv run --group dev pre-commit run --all-files
-files: ^mcap-lancedb/
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -20,13 +21,10 @@ repos:
     rev: 0.12.9
     hooks:
       - id: uv-lock
-        args: [--project, mcap-lancedb]
-        files: ^mcap-lancedb/(uv\.lock|pyproject\.toml)$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.9
     hooks:
-      # ruff finds mcap-lancedb/pyproject.toml from each file's path.
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
@@ -35,7 +33,7 @@ repos:
     hooks:
       - id: ty
         name: ty check
-        entry: uv run --directory mcap-lancedb --group dev ty check
+        entry: uv run --group dev ty check
         language: system
         types: [python]
         pass_filenames: false

@@ -13,7 +13,7 @@ Streamlit viewer for:
 ## Step-by-step guide
 
 This walks through the whole demo on nuScenes v1.0-mini: 10 scenes and 2,424
-camera frames. Run every command from this directory (`mcap-lancedb/`).
+camera frames. Run every command from the repository root.
 
 ### Before you start
 
@@ -30,10 +30,13 @@ at [nuscenes.org](https://www.nuscenes.org/terms-of-use) before downloading.
 ### 1. Install
 
 ```bash
+git clone https://github.com/justinrmiller/mcap-lancedb.git
+cd mcap-lancedb
 uv sync
 ```
 
-This creates `.venv/` with the package, its three commands, and the dev tools.
+This creates `.venv/` with the package, its two commands
+(`mcap-lancedb-ingest` and `mcap-lancedb-dedup`), and the dev tools.
 
 ### 2. Download nuScenes mini
 
@@ -251,11 +254,11 @@ uv run streamlit run src/mcap_lancedb/app.py -- --db data/lancedb-base
 | --- | --- |
 | `No nuScenes v1.0-mini tables in ...` | `--dataroot` must point at the folder containing `v1.0-mini/` and `samples/`. Redo step 2 if it's empty. |
 | `tar: Option --wildcards is not supported` | You're on macOS. Use the bsdtar command in step 2. |
-| Ray warns the runtime_env package is "approaching the maximum upload size" | Under `uv run`, Ray uploads the current directory to its workers, minus anything in `.gitignore`. Run from `mcap-lancedb/`, and keep datasets in `data/` or outside the project. |
+| Ray warns the runtime_env package is "approaching the maximum upload size" | Under `uv run`, Ray uploads the current directory to its workers, minus anything in `.gitignore`. Run from the repository root, and keep datasets in `data/` or outside the repo. |
 | Ingest hangs before any progress | The embedding actor reserves a CPU, so a 1-CPU machine deadlocks. Use at least 2 CPUs. |
 | Out of memory while embedding | Lower `--batch-size`, or use the base model. |
 | `You are sending unauthenticated requests to the HF Hub` | Harmless. Set `HF_TOKEN` for faster downloads and higher rate limits. |
-| The viewer says there's no `frames` table | It reads `data/lancedb` relative to where you launched it. Launch from `mcap-lancedb/`, or pass `-- --db PATH`. |
+| The viewer says there's no `frames` table | It reads `data/lancedb` relative to where you launched it. Launch from the repository root, or pass `-- --db PATH`. |
 | *Hide near-duplicates* is greyed out, or the Near-duplicates tab is empty | Run step 5, then reload the page. |
 | Others on your network can open the viewer | Streamlit listens on every interface by default. Add `--server.address localhost` to keep it local. |
 | The viewer doesn't rerun when you edit `app.py` | Streamlit's file watcher is off in `.streamlit/config.toml`. Its module scan touches transformers' lazy aliases, which import torchvision (not installed), and logs a traceback for each. For rerun-on-save, add `--server.fileWatcherType auto` and ignore that noise. |
@@ -383,6 +386,14 @@ which stops for its last 22 of 41 keyframes (59% of frames under 0.5 m/s), is
 next at 43%.
 
 ## Development
+
+Install the git hook once, so every commit runs ruff, ty and the file checks:
+
+```bash
+uv run --group dev pre-commit install
+```
+
+The same checks by hand:
 
 ```bash
 uv run ruff check

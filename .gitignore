@@ -5,3 +5,11 @@ data/
 __pycache__/
 .ruff_cache/
 .pytest_cache/
+
+# Build outputs and local tool state.
+dist/
+build/
+*.egg-info/
+.coverage
+.DS_Store
+.claude/settings.local.json
