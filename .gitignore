@@ -1,0 +1,7 @@
+# Downloaded dataset and LanceDB tables. Ray also reads this file, which keeps
+# data/ out of the runtime environment it uploads under `uv run`.
+data/
+.venv/
+__pycache__/
+.ruff_cache/
+.pytest_cache/

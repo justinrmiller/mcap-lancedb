@@ -1,0 +1,55 @@
+[project]
+name = "mcap-lancedb"
+version = "0.1.0"
+description = "Embedding-based curation of nuScenes camera frames in LanceDB: near-duplicate removal and semantic search."
+readme = "README.md"
+authors = [{ name = "Justin Miller" }]
+requires-python = ">=3.12"
+dependencies = [
+    "lancedb>=0.39.0",
+    "lancedb-ray>=0.1.1",
+    "numpy>=2.5.3",
+    "pandas>=3.0.6",
+    "pillow>=12.3.0",
+    "pyarrow>=25.0.1",
+    "pylance>=12.0.0",
+    "ray[data]>=2.58.0",
+    "streamlit>=1.64.0",
+    "torch>=2.14.0",
+    "transformers>=5.17.0",
+]
+
+[project.scripts]
+mcap-lancedb-ingest = "mcap_lancedb.ingest:main"
+mcap-lancedb-dedup = "mcap_lancedb.dedup:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+    "ty>=0.0.84",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "UP", "B", "SIM", "RUF", "N", "ANN", "D", "PTH", "PL", "NPY",
+]
+ignore = ["D203", "D213", "PLR0913", "PLR2004"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["mcap_lancedb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

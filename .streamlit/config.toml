@@ -1,0 +1,29 @@
+# Road-sign vernacular: Overpass (derived from Highway Gothic) on cool concrete
+# grey, with the blue of informational highway signs as the accent.
+
+[theme]
+base = "light"
+primaryColor = "#1F4E9E"
+backgroundColor = "#E8EBEE"
+secondaryBackgroundColor = "#D9DEE3"
+textColor = "#1A1F24"
+linkColor = "#1F4E9E"
+borderColor = "#BFC6CD"
+showWidgetBorder = true
+baseRadius = "0.5rem"
+font = "Overpass:https://fonts.googleapis.com/css2?family=Overpass:wght@400;600;700&display=swap, sans-serif"
+codeFont = "Overpass Mono:https://fonts.googleapis.com/css2?family=Overpass+Mono:wght@400;600&display=swap, monospace"
+headingFontWeights = [700, 700, 600, 600, 600, 600]
+chartCategoricalColors = ["#1F4E9E", "#5B7DB8", "#8FA6CC", "#3E4650", "#7A838C"]
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# Streamlit's file watcher scans every module in sys.modules after each run and
+# touches `__path__` on each one. transformers 5 registers lazy alias modules
+# (`image_processing_*_fast`) that import torchvision when touched, so the scan
+# logs one ModuleNotFoundError traceback per alias. Nothing here needs
+# torchvision, and the watcher only matters while editing app.py; pass
+# `--server.fileWatcherType auto` for rerun-on-save during development.
+fileWatcherType = "none"
