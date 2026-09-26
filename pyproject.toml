@@ -66,5 +66,4 @@ branch = true
 # A few points under the measured total, so a regression fails CI.
 fail_under = 97
 show_missing = true
-skip_covered = true
 exclude_also = ['if __name__ == "__main__":']
