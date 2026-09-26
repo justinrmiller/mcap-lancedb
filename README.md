@@ -321,19 +321,37 @@ node.
 
 ## How it works
 
-```
-MCAP scene files ──Ray tasks, one per file──▶ scene info, poses, calibrations,
-      │                                        annotations: one row per keyframe
-      │ ray.data.read_mcap(camera topics)             │ object store
-      ▼                                               ▼
-CPU tasks: keep keyframes, attach their row, decode the JPEG,
-320 px thumbnail, resize to model input
-      │ ~0.4 MB per frame, not ~4.3 MB decoded
-      ▼
-GPU actors: SigLIP 2 → L2-normalized embedding
-      │
-      ▼
-lancedb-ray: fragments written in parallel, committed as one transaction
+```mermaid
+flowchart TB
+    raw[("nuScenes mini<br/>JSON tables, JPEGs, lidar,<br/>radar, CAN bus, maps")]
+    convert["scripts/convert_mini.sh<br/>Foxglove nuscenes2mcap, run once"]
+    mcap[("MCAP files, one per scene")]
+    raw --> convert --> mcap
+
+    subgraph ingest["Ingest on Ray: mcap_lancedb.pipeline"]
+        entry["mcap-lancedb-ingest on one machine,<br/>or scripts/ingest_on_cluster.py as a Ray job"]
+        meta["Ray tasks, one per file<br/>scene info, poses, calibration,<br/>annotations → keyframe rows"]
+        read["ray.data.read_mcap<br/>camera image topics"]
+        store[["Object store<br/>keyframe rows"]]
+        decode["CPU tasks<br/>keep keyframes, attach their rows,<br/>decode JPEG, thumbnail, resize"]
+        embed["GPU actors<br/>SigLIP 2 image embeddings"]
+        write["lancedb-ray<br/>fragments written in parallel, one commit"]
+        entry --> meta & read
+        meta --> store --> decode
+        read --> decode --> embed --> write
+    end
+
+    mcap --> meta & read
+    hf[("Hugging Face<br/>SigLIP 2 weights")] --> embed
+    frames[("LanceDB frames table<br/>metadata, thumbnail, original JPEG,<br/>embedding, scalar indexes")]
+    write --> frames
+
+    dedup["mcap-lancedb-dedup<br/>exact kNN graph, greedy suppression"]
+    viewer["Streamlit viewer<br/>text and image search,<br/>near-duplicate explorer"]
+    frames -- embeddings --> dedup
+    dedup -- "nn_frame_ids, nn_similarity, dup_of" --> frames
+    frames --> viewer
+    hf --> viewer
 ```
 
 - **Keyframes only.** The converter logs camera sweeps at 12 Hz too, but only
@@ -347,7 +365,8 @@ lancedb-ray: fragments written in parallel, committed as one transaction
 - **Preprocessing matches the processor.** The CPU stage resizes with the
   checkpoint's own filter, read from `processor.image_processor`: bilinear for
   SigLIP 2, bicubic for SigLIP 1. Normalization runs on the GPU. Embeddings
-  match the Hugging Face processor path to cosine 0.9999999.
+  match the Hugging Face processor path to cosine 0.9999999, and GPU actors
+  receive about 0.4 MB per frame instead of a 4.3 MB decoded image.
 - **Text is padded to 64 tokens and lowercased**, which is how SigLIP 2 was
   trained. Other padding silently degrades retrieval. These checkpoints load a
   case-sensitive `GemmaTokenizer`, so the lowercasing has to happen in code.
