@@ -513,3 +513,8 @@ attached as the `coverage` artifact.
 
 - Ingest the camera sweeps too (12 Hz instead of 2 Hz), for a denser
   near-duplicate problem. They carry no annotations.
+
+## License
+
+The code is MIT-licensed; see [LICENSE](LICENSE). nuScenes isn't included and
+keeps its own terms: CC BY-NC-SA 4.0, for non-commercial use.
