@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
 
@@ -78,7 +78,7 @@ jobs:
         with:
           name: coverage
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
 
       - name: Render the badge
         run: uvx --from "genbadge[coverage]" genbadge coverage --local -i coverage.xml -o coverage.svg
