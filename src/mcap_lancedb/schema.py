@@ -1,9 +1,9 @@
 """Arrow schema for the ``frames`` table.
 
 One row per camera keyframe, fully denormalized. The schema is built up in three
-stages that mirror the pipeline: metadata from the MCAP files (driver), media
-(CPU stage), then the embedding (GPU stage). The dedup columns are merged in
-later by ``mcap-lancedb-dedup``.
+stages that mirror the pipeline: metadata from the MCAP files (a Ray task per
+file), media (CPU stage), then the embedding (GPU stage). The dedup columns are
+merged in later by ``mcap-lancedb-dedup``.
 """
 
 import pyarrow as pa

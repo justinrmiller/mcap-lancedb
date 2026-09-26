@@ -346,7 +346,7 @@ def frames_dataset(
             filesystem=filesystem,
             include_paths=True,
         )
-        # One batch per file: each decode task joins one scene's images.
+        # One batch per block, so each task builds its keyframe lookup once.
         .map_batches(
             functools.partial(
                 decode_frames,

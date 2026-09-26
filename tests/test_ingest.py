@@ -1,6 +1,7 @@
 """Tests for the ingest pipeline: its stages, both entry points, and planning."""
 
 import io
+import runpy
 from pathlib import Path
 
 import foxglove
@@ -39,6 +40,8 @@ from mcap_lancedb.schema import (
     THUMBNAIL_COLUMN,
     frame_schema,
 )
+
+CLUSTER_SCRIPT = Path(__file__).parents[1] / "scripts" / "ingest_on_cluster.py"
 
 SCALAR_INDEXES = {
     "frame_id": "BTree",
@@ -261,3 +264,35 @@ def test_pipeline_without_keyframes_raises(tmp_path: Path) -> None:
             run(config)
     finally:
         ray.shutdown()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--mcap-uri", "data/mcap", "--db-uri", "/abs/db"],
+        ["--mcap-uri", "/abs/mcap", "--db-uri", "data/lancedb"],
+        ["--mcap-uri", "/abs/mcap", "--db-uri", "/abs/db", "--min-gpu-actors", "0"],
+        [
+            "--mcap-uri",
+            "s3://bucket/mcap",
+            "--db-uri",
+            "s3://bucket/db",
+            "--min-gpu-actors",
+            "4",
+            "--max-gpu-actors",
+            "2",
+        ],
+    ],
+)
+def test_cluster_job_rejects_bad_arguments(argv: list[str]) -> None:
+    """Relative paths and impossible actor bounds fail before Ray starts."""
+    job = runpy.run_path(str(CLUSTER_SCRIPT))
+    with pytest.raises(SystemExit):
+        job["parse_args"](argv)
+
+
+def test_cluster_job_accepts_uris_and_absolute_paths() -> None:
+    """Object-store URIs and absolute paths both pass."""
+    job = runpy.run_path(str(CLUSTER_SCRIPT))
+    args = job["parse_args"](["--mcap-uri", "gs://b/mcap", "--db-uri", "/abs/db"])
+    assert (args.mcap_uri, args.db_uri) == ("gs://b/mcap", "/abs/db")

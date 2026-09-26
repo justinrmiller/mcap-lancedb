@@ -7,10 +7,10 @@ JPEG (``/<camera>/image_rect_compressed``), its calibration
 (``/<camera>/annotations``). Sweeps between keyframes get an image and a
 calibration, but no annotations.
 
-The driver reads everything but the images here, into one record per camera
-keyframe. The images are read by ``ray.data.read_mcap`` in the ingest pipeline
-and joined to these records on (file, channel, log time). Every record is fully
-denormalized because LanceDB has no joins.
+This module reads everything but the images, into one record per camera
+keyframe; the ingest pipeline runs it as one Ray task per file. The images are
+read by ``ray.data.read_mcap`` and matched to these records on (file, channel,
+log time). Every record is fully denormalized because LanceDB has no joins.
 """
 
 import re

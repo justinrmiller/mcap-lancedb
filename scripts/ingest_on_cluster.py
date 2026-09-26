@@ -17,6 +17,7 @@ an actor starts there.
 
 import argparse
 import logging
+import posixpath
 from collections.abc import Sequence
 
 import ray
@@ -25,6 +26,30 @@ from mcap_lancedb import CAMERA_CHANNELS, DEFAULT_MODEL
 from mcap_lancedb.pipeline import WORKER_ENV, IngestConfig, configure_logging, run
 
 logger = logging.getLogger("ingest_on_cluster")
+
+
+def storage_location(value: str) -> str:
+    """Accept a URI or an absolute path, never a relative one.
+
+    A Ray job runs in its own copy of the working directory, so a relative
+    path would read from, or write the table into, that throwaway copy.
+
+    Args:
+        value: The raw argument.
+
+    Returns:
+        The value, unchanged.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is a relative path.
+    """
+    if "://" in value or posixpath.isabs(value):
+        return value
+    msg = (
+        f"{value!r} is relative; pass a URI such as s3://bucket/path or an "
+        "absolute path, since a Ray job runs in its own working directory"
+    )
+    raise argparse.ArgumentTypeError(msg)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -42,10 +67,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mcap-uri",
         required=True,
+        type=storage_location,
         help="Directory of per-scene MCAP files, e.g. s3://bucket/nuscenes-mcap.",
     )
     parser.add_argument(
-        "--db-uri", required=True, help="LanceDB directory, e.g. s3://bucket/lancedb."
+        "--db-uri",
+        required=True,
+        type=storage_location,
+        help="LanceDB directory, e.g. s3://bucket/lancedb.",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
@@ -82,7 +111,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vector-index", choices=["auto", "always", "never"], default="auto"
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.min_gpu_actors < 1:
+        parser.error("--min-gpu-actors must be at least 1")
+    if args.max_gpu_actors is not None and args.max_gpu_actors < args.min_gpu_actors:
+        parser.error("--max-gpu-actors must be at least --min-gpu-actors")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -114,6 +148,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             channels=tuple(args.channels),
             limit=args.limit,
             batch_size=args.batch_size,
+            # Without a GPU reservation, keep the actors off any GPU the
+            # node has, including an Apple silicon one.
+            device="cpu" if args.gpus_per_actor == 0 else None,
             embed_actors=(args.min_gpu_actors, max_actors),
             gpus_per_actor=args.gpus_per_actor,
             vector_index=args.vector_index,

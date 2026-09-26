@@ -26,7 +26,7 @@ keyframes. Run every command from the repository root.
 | You need | Notes |
 | --- | --- |
 | [uv](https://docs.astral.sh/uv/) and git | uv installs Python 3.12 for the project, 3.11 for the converter, and every dependency. |
-| About 25 GB of disk | 10 GB of nuScenes (deletable after step 3), 4.7 GB of MCAP, 6 GB of model weights, 1.6 GB environment, 450 MB per table. |
+| About 25 GB of disk | 10 GB of nuScenes (deletable after step 3), 4.7 GB of MCAP, 6 GB of model weights, 1.7 GB environment, 450 MB per table. |
 | 16 GB of RAM | The default model alone is 4.5 GB in fp32. |
 | A GPU (optional) | NVIDIA (CUDA) or Apple silicon (MPS). Without one, use the faster base model. |
 
@@ -280,7 +280,7 @@ uvx --python 3.12 --from "ray[default]==2.58.0" ray stop
 | `--mcap-uri` | required | Directory of per-scene MCAP files: a local path, `s3://`, `gs://` or anything else pyarrow opens. |
 | `--db-uri` | required | LanceDB directory or URI. |
 | `--min-gpu-actors` | 1 | Embedding actors kept running. |
-| `--max-gpu-actors` | the cluster's GPUs at start | Ray Data adds actors up to this while GPU work is queued. |
+| `--max-gpu-actors` | as many as the cluster's GPUs fit at start | Ray Data adds actors up to this while GPU work is queued. Set it on autoscaling clusters, which may start with no GPUs. |
 | `--gpus-per-actor` | 1 | `0.5` packs two actors per GPU; `0` runs on CPU. |
 | `--batch-size` | 64 | Frames per embedding batch. |
 | `--ray-address` | `auto` | The cluster running the job. `local` starts a throwaway one instead. |
@@ -326,25 +326,26 @@ flowchart TB
     raw[("nuScenes mini<br/>JSON tables, JPEGs, lidar,<br/>radar, CAN bus, maps")]
     convert["scripts/convert_mini.sh<br/>Foxglove nuscenes2mcap, run once"]
     mcap[("MCAP files, one per scene")]
+    entry["mcap-lancedb-ingest on one machine,<br/>or scripts/ingest_on_cluster.py as a Ray job"]
+    hf[("Hugging Face<br/>SigLIP 2 weights")]
     raw --> convert --> mcap
 
     subgraph ingest["Ingest on Ray: mcap_lancedb.pipeline"]
-        entry["mcap-lancedb-ingest on one machine,<br/>or scripts/ingest_on_cluster.py as a Ray job"]
-        meta["Ray tasks, one per file<br/>scene info, poses, calibration,<br/>annotations → keyframe rows"]
+        direction LR
+        meta["Ray tasks, one per file<br/>scene info, poses,<br/>calibration, annotations"]
         read["ray.data.read_mcap<br/>camera image topics"]
-        store[["Object store<br/>keyframe rows"]]
         decode["CPU tasks<br/>keep keyframes, attach their rows,<br/>decode JPEG, thumbnail, resize"]
         embed["GPU actors<br/>SigLIP 2 image embeddings"]
-        write["lancedb-ray<br/>fragments written in parallel, one commit"]
-        entry --> meta & read
-        meta --> store --> decode
+        write["lancedb-ray<br/>fragments written in<br/>parallel, one commit"]
+        meta -- "keyframe rows<br/>via the object store" --> decode
         read --> decode --> embed --> write
     end
 
-    mcap --> meta & read
-    hf[("Hugging Face<br/>SigLIP 2 weights")] --> embed
+    mcap --> ingest
+    entry -. runs .-> ingest
+    hf --> ingest
     frames[("LanceDB frames table<br/>metadata, thumbnail, original JPEG,<br/>embedding, scalar indexes")]
-    write --> frames
+    ingest --> frames
 
     dedup["mcap-lancedb-dedup<br/>exact kNN graph, greedy suppression"]
     viewer["Streamlit viewer<br/>text and image search,<br/>near-duplicate explorer"]
