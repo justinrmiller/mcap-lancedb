@@ -1,27 +1,33 @@
 # mcap-lancedb
 
-Embedding-based curation for robotics and AV fleet data: find the right 1% of
-camera frames. mcap-lancedb ingests nuScenes camera keyframes into LanceDB with
-Ray Data, embeds them with SigLIP 2, marks near-duplicates, and ships a
-Streamlit viewer for:
+[![CI](https://github.com/justinrmiller/mcap-lancedb/actions/workflows/ci.yml/badge.svg)](https://github.com/justinrmiller/mcap-lancedb/actions/workflows/ci.yml)
+[![Coverage](https://github.com/justinrmiller/mcap-lancedb/raw/badges/coverage.svg)](https://github.com/justinrmiller/mcap-lancedb/actions/workflows/ci.yml)
+
+Embedding-based curation for robotics and AV fleet data. mcap-lancedb reads
+driving logs stored as [MCAP](https://mcap.dev/), ingests their camera
+keyframes into LanceDB with Ray Data, embeds them with SigLIP 2, marks
+near-duplicates, and ships a Streamlit viewer for:
 
 1. **Text-to-image search** with metadata filters: camera, location, day or
    night, pedestrians in view, object categories, and hiding near-duplicates.
 2. **Interactive near-duplicate removal**: move a threshold slider and watch
    removals concentrate where the car was standing still.
 
+The demo data is nuScenes v1.0-mini, converted to MCAP once with Foxglove's
+[nuscenes2mcap](https://github.com/foxglove/nuscenes2mcap).
+
 ## Step-by-step guide
 
-This walks through the whole demo on nuScenes v1.0-mini: 10 scenes and 2,424
-camera frames. Run every command from the repository root.
+This walks through the demo on nuScenes mini: 10 scenes and 2,424 camera
+keyframes. Run every command from the repository root.
 
 ### Before you start
 
 | You need | Notes |
 | --- | --- |
-| [uv](https://docs.astral.sh/uv/) | It installs Python 3.12 and every dependency for you. |
-| About 8 GB of disk | 1.6 GB environment, 4.5 GB model weights, 450 MB of dataset, 450 MB per table. |
-| 16 GB of RAM | The default model is 4.5 GB in fp32, and the viewer loads it too. |
+| [uv](https://docs.astral.sh/uv/) and git | uv installs Python 3.12 for the project, 3.11 for the converter, and every dependency. |
+| About 25 GB of disk | 10 GB of nuScenes (deletable after step 3), 4.7 GB of MCAP, 6 GB of model weights, 1.6 GB environment, 450 MB per table. |
+| 16 GB of RAM | The default model alone is 4.5 GB in fp32. |
 | A GPU (optional) | NVIDIA (CUDA) or Apple silicon (MPS). Without one, use the faster base model. |
 
 nuScenes is licensed for non-commercial use (CC BY-NC-SA 4.0). Read the terms
@@ -40,81 +46,90 @@ This creates `.venv/` with the package, its two commands
 
 ### 2. Download nuScenes mini
 
-The tarball is 4.2 GB, but it's streamed straight into `tar`, and only the JSON
-tables and camera keyframes are kept, about 450 MB on disk.
+The converter needs the whole mini release (every sensor, not just cameras),
+the CAN bus expansion and the map expansion: 5.4 GB of downloads from the
+public nuScenes bucket, no login.
 
 ```bash
-mkdir -p data/nuscenes
+mkdir -p data/nuscenes/maps
 ```
-
-On Linux (GNU tar):
 
 ```bash
-curl -s https://www.nuscenes.org/data/v1.0-mini.tgz | tar -xz -C data/nuscenes --wildcards 'v1.0-mini/*' 'samples/CAM_*'
+curl -fsS https://motional-nuscenes.s3.ap-northeast-1.amazonaws.com/public/v1.0/v1.0-mini.tgz | tar -xz -C data/nuscenes
 ```
-
-On macOS (bsdtar, which matches patterns without the flag):
 
 ```bash
-curl -s https://www.nuscenes.org/data/v1.0-mini.tgz | tar -xz -C data/nuscenes 'v1.0-mini/*' 'samples/CAM_*'
+curl -fsSO https://motional-nuscenes.s3.ap-northeast-1.amazonaws.com/public/v1.0/can_bus.zip && unzip -q can_bus.zip -d data/nuscenes && rm can_bus.zip
 ```
-
-Check it arrived. This should print `2424`:
 
 ```bash
-find data/nuscenes/samples -name '*.jpg' | wc -l
+curl -fsSO https://motional-nuscenes.s3.ap-northeast-1.amazonaws.com/public/v1.0/nuScenes-map-expansion-v1.3.zip && unzip -q nuScenes-map-expansion-v1.3.zip -d data/nuscenes/maps && rm nuScenes-map-expansion-v1.3.zip
 ```
 
-`data/` is in `.gitignore`, which also keeps it out of the environment Ray
-uploads to its workers (see [Troubleshooting](#troubleshooting)).
+### 3. Convert to MCAP
 
-### 3. Run a smoke test
+```bash
+scripts/convert_mini.sh
+```
 
-Before the full run, push 200 frames through the whole pipeline with the small
-model into a throwaway database:
+The script clones nuscenes2mcap into `data/nuscenes2mcap` at a pinned commit,
+builds its Python 3.11 environment with uv (no Docker needed), and writes one
+file per scene to `data/mcap`. It takes about 4 minutes. Check it worked; this
+should list 10 files, about 4.7 GB in all:
+
+```bash
+ls -lh data/mcap
+```
+
+Each file holds a scene's full log: camera JPEGs (unchanged from nuScenes),
+lidar, radar, poses, calibrations, CAN bus, maps and annotation boxes, with the
+scene's description in a `scene-info` metadata record. Once it's done you can
+delete `data/nuscenes` and `data/nuscenes2mcap`; nothing else reads them.
+
+### 4. Run a smoke test
+
+Before the full run, push 200 frames through the pipeline with the small model
+into a throwaway database:
 
 ```bash
 uv run mcap-lancedb-ingest --model google/siglip2-base-patch16-224 --limit 200 --db data/lancedb-smoke
 ```
 
-The first run downloads the model (1.5 GB). It ends with:
+The first run downloads the model (1.5 GB). Amid Ray's progress output, it
+logs:
 
 ```
-INFO mcap_lancedb.ingest: Found 200 camera keyframes in v1.0-mini
 INFO mcap_lancedb.ingest: Embedding with google/siglip2-base-patch16-224 on 1 actor(s), 1 GPU(s) each
-INFO mcap_lancedb.ingest: Skipping the vector index: 200 rows search faster exactly
-INFO mcap_lancedb.ingest: Wrote 200 frames to .../data/lancedb-smoke/frames
+INFO mcap_lancedb.pipeline: Found 200 camera keyframes in 1 MCAP file(s)
+INFO mcap_lancedb.pipeline: Skipping the vector index: 200 rows search faster exactly
+INFO mcap_lancedb.pipeline: Wrote 200 frames to .../data/lancedb-smoke/frames
 ```
 
-The actor line depends on your hardware: `0 GPU(s)` on a CPU-only machine,
-one actor per GPU on a CUDA box. Ray also prints its own progress in between.
-Once it works, delete the throwaway table:
+The actor line depends on your hardware (see
+[Scaling out](#scaling-out)). Then delete the throwaway table:
 
 ```bash
 rm -rf data/lancedb-smoke
 ```
 
-### 4. Ingest every frame
+### 5. Ingest every frame
 
 ```bash
 uv run mcap-lancedb-ingest
 ```
 
-The defaults are `--dataroot data/nuscenes --version v1.0-mini --db
-data/lancedb` and the quality model, `google/siglip2-so400m-patch14-384` (a
-4.5 GB download the first time). Expect about 7 minutes on an Apple M4 Pro.
-Without a GPU, use the base model instead; it takes under 3 minutes on 12 CPU
-cores:
+This uses the default model, `google/siglip2-so400m-patch16-384` (a 4.5 GB
+download the first time), and takes about 7 minutes on an Apple M4 Pro.
+Without a GPU, use the base model instead:
 
 ```bash
 uv run mcap-lancedb-ingest --model google/siglip2-base-patch16-224
 ```
 
-It finishes with `Wrote 2424 frames to .../data/lancedb/frames`. Running ingest
-again replaces the table, including any dedup results, so rerun dedup
-afterwards.
+It finishes with `Wrote 2424 frames to .../data/lancedb/frames`. Rerunning
+ingest replaces the table, dedup results included, so rerun dedup afterwards.
 
-### 5. Mark near-duplicates
+### 6. Mark near-duplicates
 
 ```bash
 uv run mcap-lancedb-dedup
@@ -123,17 +138,16 @@ uv run mcap-lancedb-dedup
 This takes seconds. With the default model you should see:
 
 ```
-INFO mcap_lancedb.dedup: Built an exact 32-NN graph over 2424 frames on mps in 0.4s
-INFO mcap_lancedb.dedup: Nearest-neighbor similarity percentiles p10/p50/p90/p99: 0.940 / 0.978 / 0.996 / 0.999
-INFO mcap_lancedb.dedup: Threshold 0.985 marks 623 of 2424 frames as near-duplicates (25.7%)
+INFO mcap_lancedb.dedup: Built an exact 32-NN graph over 2424 frames on mps in 0.1s
+INFO mcap_lancedb.dedup: Nearest-neighbor similarity percentiles p10/p50/p90/p99: 0.938 / 0.978 / 0.996 / 0.999
+INFO mcap_lancedb.dedup: Threshold 0.985 marks 603 of 2424 frames as near-duplicates (24.9%)
 INFO mcap_lancedb.dedup: Merged nn_frame_ids, nn_similarity, dup_of into frames
 ```
 
-With the base model it's 631 frames at 0.98. Frames are marked, never deleted.
 Rerun with a different `--threshold` at any time; it replaces the previous
 marks.
 
-### 6. Explore in the viewer
+### 7. Explore in the viewer
 
 ```bash
 uv run streamlit run src/mcap_lancedb/app.py
@@ -152,17 +166,14 @@ few seconds.
    search (a prefilter), so you still get a full page whenever enough frames
    match. *Must show* keeps only frames where every chosen object category is
    in view of that camera, not just somewhere around the car.
-3. Turn on *Hide near-duplicates* to search only the frames dedup kept (1,801
-   of 2,424 at the default threshold). Don't expect a stationary scene to
-   vanish: scene-0553 is stopped at a busy crossing where pedestrians keep
-   moving, so it still keeps 70 of its 246 frames.
+3. Turn on *Hide near-duplicates* to search only the frames dedup kept (1,821
+   of 2,424 at the default threshold). A stationary scene won't vanish:
+   scene-0553 is stopped at a busy crossing where pedestrians keep moving, so
+   it keeps 70 of its 246 frames.
 4. *More like this* searches by image, using that frame's stored embedding.
    *Back to text search* returns to your query.
 5. *Full resolution* opens the original 1600×900 JPEG, read from the table on
    demand.
-
-Text-to-image similarities are low in absolute terms, around 0.1 to 0.2. That's
-normal for SigLIP; only the ranking matters.
 
 **Near-duplicates tab**
 
@@ -175,9 +186,9 @@ normal for SigLIP; only the ranking matters.
    similar first, so you can judge the threshold's weakest calls.
 5. Drag the threshold slider. Everything above recomputes from the stored
    neighbor graph in a moment, and nothing in the table changes. To make a new
-   threshold stick for *Hide near-duplicates*, rerun step 5 with `--threshold`.
+   threshold stick for *Hide near-duplicates*, rerun step 6 with `--threshold`.
 
-### 7. Query the table from Python (optional)
+### 8. Query the table from Python (optional)
 
 The table is ordinary LanceDB, so anything the viewer does is a few lines of
 code:
@@ -209,13 +220,12 @@ Embeddings from different models aren't comparable.
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--dataroot` | `data/nuscenes` | The folder that contains `v1.0-mini/` and `samples/`. |
-| `--version` | `v1.0-mini` | `v1.0-trainval` works without code changes. |
+| `--mcap-dir` | `data/mcap` | One nuscenes2mcap file per scene, directly in this directory. |
 | `--db` | `data/lancedb` | LanceDB directory. The table is always named `frames`. |
-| `--model` | `google/siglip2-so400m-patch14-384` | `google/siglip2-base-patch16-224` is several times faster. Fixed-resolution SigLIP checkpoints only. |
+| `--model` | `google/siglip2-so400m-patch16-384` | `google/siglip2-base-patch16-224` is several times faster. Fixed-resolution SigLIP checkpoints only. |
 | `--device` | `auto` | CUDA, then MPS, then CPU. fp16 on CUDA, fp32 elsewhere. |
 | `--channels` | all six | Any subset of `CAM_FRONT` … `CAM_FRONT_LEFT`. |
-| `--limit` | none | Ingest only the first N frames, in scene, camera and time order. |
+| `--limit` | none | Ingest only the first N frames, in file, camera and time order. |
 | `--batch-size` | 32 | Frames per embedding batch. Lower it if the GPU runs out of memory. |
 | `--vector-index` | `auto` | IVF_PQ only at 100k rows or more; `always` or `never` override. |
 
@@ -232,72 +242,115 @@ The viewer takes `--db` after a `--`, or the `MCAP_LANCEDB_DB` environment
 variable:
 
 ```bash
-uv run streamlit run src/mcap_lancedb/app.py -- --db data/lancedb-base
+uv run streamlit run src/mcap_lancedb/app.py -- --db path/to/lancedb
 ```
 
-## Running on other hardware
+## Scaling out
 
-- **CUDA box with two GPUs**: Ray reports both, so the embedding stage runs one
-  actor per GPU (`ActorPoolStrategy(size=2)`, one GPU each). Decoding and
-  resizing stay on CPU tasks.
-- **Apple silicon**: Ray 2.58 reports the Mac's GPU as one GPU, so one actor
-  runs on MPS.
-- **CPU only**: one actor. Ray fuses the decode and embed stages because their
-  resources match, which is fine here.
-- **A Ray cluster**: set `RAY_ADDRESS` and ingest joins it. `--dataroot` and
-  `--db` must be on shared storage (a NAS) mounted at the same path on every
-  node.
+On one machine, `mcap-lancedb-ingest` runs one embedding actor per GPU that Ray
+reports, or a single actor without one. Ray reports an Apple silicon Mac's GPU
+as one GPU, which the actor uses through MPS.
+
+For a large cluster, [scripts/ingest_on_cluster.py](scripts/ingest_on_cluster.py)
+runs the same pipeline (`mcap_lancedb.pipeline`) as a Ray job, independent of
+the viewer and dedup. It reads MCAP from object storage, writes LanceDB to a
+URI, and autoscales the GPU actor pool. Submit it with Ray's job CLI, which
+needs `ray[default]` at the cluster's Ray version; `uvx` fetches it without
+touching the project:
+
+```bash
+uvx --from "ray[default]==2.58.0" ray job submit --address http://HEAD:8265 --working-dir . -- uv run scripts/ingest_on_cluster.py --mcap-uri s3://BUCKET/nuscenes-mcap --db-uri s3://BUCKET/lancedb --min-gpu-actors 2 --max-gpu-actors 16
+```
+
+To try it without a cluster, start a local head node, submit to
+`http://127.0.0.1:8265` with local paths (for example
+`--mcap-uri "$PWD/data/mcap" --db-uri "$PWD/data/lancedb-job" --limit 12`),
+then stop the head:
+
+```bash
+uvx --python 3.12 --from "ray[default]==2.58.0" ray start --head --dashboard-host 127.0.0.1
+```
+
+```bash
+uvx --python 3.12 --from "ray[default]==2.58.0" ray stop
+```
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--mcap-uri` | required | Directory of per-scene MCAP files: a local path, `s3://`, `gs://` or anything else pyarrow opens. |
+| `--db-uri` | required | LanceDB directory or URI. |
+| `--min-gpu-actors` | 1 | Embedding actors kept running. |
+| `--max-gpu-actors` | the cluster's GPUs at start | Ray Data adds actors up to this while GPU work is queued. |
+| `--gpus-per-actor` | 1 | `0.5` packs two actors per GPU; `0` runs on CPU. |
+| `--batch-size` | 64 | Frames per embedding batch. |
+| `--ray-address` | `auto` | The cluster running the job. `local` starts a throwaway one instead. |
+
+`--model`, `--channels`, `--limit` and `--vector-index` work as for ingest.
+How the work spreads:
+
+- **Metadata:** one Ray task per MCAP file reads its scene info, poses,
+  calibrations and annotations. The rows (about 0.5 KB per frame) go to every
+  decode task through the object store, so images are never shuffled.
+- **Images:** `ray.data.read_mcap` reads the camera topics, one file per task,
+  so a few thousand scene files keep a large cluster busy. CPU tasks decode
+  them; GPU actors embed them.
+- **Environment:** under `uv run`, Ray rebuilds the project's locked
+  environment on each node. Storage credentials come from the environment, as
+  usual for pyarrow and LanceDB.
+- **Model weights:** each node downloads the model into its Hugging Face cache
+  when its first actor starts. Set `HF_HOME` to shared storage to download it
+  once.
+
+The local CLI can also join a running cluster: set `RAY_ADDRESS`. `--mcap-dir`
+and `--db` must then be on shared storage mounted at the same path on every
+node.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
-| `No nuScenes v1.0-mini tables in ...` | `--dataroot` must point at the folder containing `v1.0-mini/` and `samples/`. Redo step 2 if it's empty. |
-| `tar: Option --wildcards is not supported` | You're on macOS. Use the bsdtar command in step 2. |
+| `No .mcap files in ...` | Run step 3, or point `--mcap-dir` at the converted scenes. |
+| `... has no scene-info metadata` | The file wasn't written by nuscenes2mcap. Keep only its output in `--mcap-dir`. |
 | Ray warns the runtime_env package is "approaching the maximum upload size" | Under `uv run`, Ray uploads the current directory to its workers, minus anything in `.gitignore`. Run from the repository root, and keep datasets in `data/` or outside the repo. |
-| Ingest hangs before any progress | The embedding actor reserves a CPU, so a 1-CPU machine deadlocks. Use at least 2 CPUs. |
 | Out of memory while embedding | Lower `--batch-size`, or use the base model. |
 | `You are sending unauthenticated requests to the HF Hub` | Harmless. Set `HF_TOKEN` for faster downloads and higher rate limits. |
 | The viewer says there's no `frames` table | It reads `data/lancedb` relative to where you launched it. Launch from the repository root, or pass `-- --db PATH`. |
-| *Hide near-duplicates* is greyed out, or the Near-duplicates tab is empty | Run step 5, then reload the page. |
+| *Hide near-duplicates* is greyed out, or the Near-duplicates tab is empty | Run step 6, then reload the page. |
 | Others on your network can open the viewer | Streamlit listens on every interface by default. Add `--server.address localhost` to keep it local. |
-| The viewer doesn't rerun when you edit `app.py` | Streamlit's file watcher is off in `.streamlit/config.toml`. Its module scan touches transformers' lazy aliases, which import torchvision (not installed), and logs a traceback for each. For rerun-on-save, add `--server.fileWatcherType auto` and ignore that noise. |
+| The viewer doesn't rerun when you edit `app.py` | `.streamlit/config.toml` turns Streamlit's file watcher off, because its module scan logs a torchvision traceback for each of transformers' lazy aliases. Add `--server.fileWatcherType auto` for rerun-on-save and ignore that noise. |
 
 ## How it works
 
 ```
-JSON tables ──driver──▶ one metadata row per camera keyframe
-                          │ ray.data.from_arrow(...).repartition(n)
-                          ▼
-                   CPU tasks: read JPEG, keep original bytes,
-                   320 px thumbnail, resize to model input
-                          │ ~0.4 MB per frame, not ~4.3 MB decoded
-                          ▼
-                   GPU actors: SigLIP 2 → L2-normalized embedding
-                          │
-                          ▼
-             lancedb-ray: fragments written in parallel,
-             committed as one transaction
+MCAP scene files ──Ray tasks, one per file──▶ scene info, poses, calibrations,
+      │                                        annotations: one row per keyframe
+      │ ray.data.read_mcap(camera topics)             │ object store
+      ▼                                               ▼
+CPU tasks: keep keyframes, attach their row, decode the JPEG,
+320 px thumbnail, resize to model input
+      │ ~0.4 MB per frame, not ~4.3 MB decoded
+      ▼
+GPU actors: SigLIP 2 → L2-normalized embedding
+      │
+      ▼
+lancedb-ray: fragments written in parallel, committed as one transaction
 ```
 
-- **No nuscenes-devkit.** `nuscenes_io.py` reads the JSON tables directly and
-  joins them in dictionaries.
-- **Objects per camera, not per sample.** Annotation box centers are projected
-  global → ego → camera → pixels, and only boxes a lidar or radar point touched
-  count. So a frame's `num_pedestrians` means pedestrians in *that* image.
-- **Preprocessing matches the processor exactly.** The CPU stage resizes with
-  the checkpoint's own filter, read from `processor.image_processor`: bilinear
-  for SigLIP 2, bicubic for SigLIP 1. Normalization runs on the GPU.
-  Embeddings match the Hugging Face processor path to cosine 0.9999999.
+- **Keyframes only.** The converter logs camera sweeps at 12 Hz too, but only
+  keyframes (2 Hz) carry annotations. A keyframe's image, calibration,
+  annotations and ego pose share one log time, which is how images are matched
+  to their rows.
+- **Objects per camera, not per sample.** The converter projects each
+  annotation box into every camera with the nuScenes devkit and logs the boxes
+  that land in the image. So a frame's `num_pedestrians` means pedestrians in
+  *that* image.
+- **Preprocessing matches the processor.** The CPU stage resizes with the
+  checkpoint's own filter, read from `processor.image_processor`: bilinear for
+  SigLIP 2, bicubic for SigLIP 1. Normalization runs on the GPU. Embeddings
+  match the Hugging Face processor path to cosine 0.9999999.
 - **Text is padded to 64 tokens and lowercased**, which is how SigLIP 2 was
   trained. Other padding silently degrades retrieval. These checkpoints load a
   case-sensitive `GemmaTokenizer`, so the lowercasing has to happen in code.
-- **pyarrow batches end to end.** Numpy batches would turn embeddings into
-  Ray's tensor extension type, which won't cast to `fixed_size_list`.
-- **lancedb-ray, not `Dataset.write_lance`.** Ray's built-in Lance sink passes
-  `storage_options_provider` to `lance.fragment.write_fragments`, which pylance
-  12 removed. lancedb-ray delegates to `lance-ray`, which only passes that
-  argument on pylance 4.x, and it preserves field and schema metadata.
 - **Exact similarities in the viewer.** Searches re-rank candidates by exact
   distance (`refine_factor`), so the similarity shown is exact even when an
   IVF_PQ index is in play.
@@ -308,33 +361,33 @@ One table, `frames`, with one row per camera keyframe.
 
 | Group | Columns |
 | --- | --- |
-| IDs and provenance | `frame_id` (sample_data token), `sample_token`, `scene_token`, `scene_name`, `source_path` (relative to the dataroot) |
+| IDs and provenance | `frame_id` (scene/channel/capture time in µs), `scene_name`, `source_path` (the scene's MCAP file), `mcap_log_time` (the image message's log time, ns) |
 | Scene context | `scene_description`, `scene_tags`, `is_night`, `is_rain`, `location`, `log_date`, `vehicle` |
-| Camera | `channel`, `timestamp` (µs, UTC), `frame_index`, `width`, `height`, `cam_intrinsic` (9 × float32) |
+| Camera | `channel`, `timestamp` (capture time, µs, UTC), `frame_index`, `width`, `height`, `cam_intrinsic` (9 × float32) |
 | Ego | `ego_translation` (3 × float64), `ego_rotation` ([w, x, y, z]), `ego_speed_mps` |
 | Objects in this camera | `visible_categories`, `num_visible_objects`, `num_pedestrians`, `num_cyclists`, `num_vehicles` |
 | Media | `thumbnail` (inline JPEG, 320 px long edge, q85), `image` (original JPEG bytes, `large_binary`) |
 | Embedding | `embedding` (`fixed_size_list<float32, D>`, L2-normalized) |
 | Dedup, merged later | `nn_frame_ids`, `nn_similarity` (top-k neighbors), `dup_of` (null means kept) |
 
-Table-level schema metadata records the embedding model, its dimension, the
-nuScenes version, and, after dedup, the threshold and k. The viewer embeds text
-queries with the model named there, so queries and frames always share a space.
+Table-level schema metadata records the embedding model, its dimension, and,
+after dedup, the threshold and k. The viewer embeds text queries with the model
+named there, so queries and frames always share a space.
 
 Why it looks like this:
 
-- **Fully denormalized.** LanceDB has no joins, so scene, log, pose and
-  calibration data are copied onto every frame. A filter like "night frames at
-  boston-seaport with two or more pedestrians" is one prefilter on one table.
+- **Fully denormalized.** LanceDB has no joins, so scene, pose and calibration
+  data are copied onto every frame. A filter like "night frames at
+  singapore-hollandvillage with two or more pedestrians" is one prefilter on
+  one table.
 - **Originals inline, but never read by accident.** `image` is a plain
   `large_binary` column. Lance reads only the columns a query projects, so
   searches and scans that leave it out (all of them, apart from the
   full-resolution view) never pay for it. Grids read the small `thumbnail`
   column instead.
-- **Near-duplicates are marked, never deleted.** Dedup merges its columns in
-  with `LanceDataset.merge`, after dropping old ones on reruns. The raw data
-  stays intact, "hide near-duplicates" is just `dup_of IS NULL`, and the viewer
-  can re-run suppression at any threshold from the stored graph.
+- **Near-duplicates are marked, never deleted.** Dedup only adds columns, so
+  "hide near-duplicates" is just `dup_of IS NULL`, and the viewer can re-run
+  suppression at any threshold from the stored graph.
 - **The vector index is conditional.** Below 100k rows an exact search is faster
   than IVF_PQ and has perfect recall, so `--vector-index auto` skips it. Scalar
   indexes always exist: BITMAP on `channel` and `location`, BTREE on
@@ -353,89 +406,92 @@ A~B~C until A and C look nothing alike. Instead, edges at or above the threshold
 are made symmetric and frames are visited in priority order (most visible
 objects first, then earliest). Each unvisited frame is kept and marks its
 unvisited neighbors `dup_of` itself. A suppressed frame never suppresses others.
-The viewer runs the same function, and at the stored threshold it reproduces
-the stored `dup_of` frame for frame (a test pins this).
+The viewer runs the same function, so at the stored threshold it reproduces
+the stored `dup_of` frame for frame.
 
 ### Calibrating the threshold
 
-The threshold was chosen from the data, not assumed. Consecutive 2 Hz keyframes
-from one camera are very similar even while driving. The median
-nearest-neighbor similarity on mini is 0.973 (base) and 0.978 (so400m), so a
-generic 0.95 would remove about half of the frames taken at over 3 m/s.
+Consecutive 2 Hz keyframes from one camera are very similar even while
+driving. The median nearest-neighbor similarity on mini is 0.973 (base) and
+0.978 (so400m), so a generic 0.95 would remove about half of the frames taken
+at over 3 m/s.
 
 Removal rates on mini, so400m, stationary (< 0.5 m/s) vs moving (≥ 3 m/s):
 
 | Threshold | All frames | Stationary | Moving | Gap |
 | --- | ---: | ---: | ---: | ---: |
-| 0.950 | 65.5% | 90.1% | 54.4% | 36 pts |
-| 0.970 | 47.0% | 82.7% | 31.3% | 51 pts |
-| 0.980 | 33.3% | 73.7% | 16.9% | 57 pts |
-| **0.985** | **25.7%** | **66.5%** | **9.7%** | **57 pts** |
-| 0.990 | 17.3% | 56.8% | 2.3% | 55 pts |
+| 0.950 | 65.1% | 90.3% | 53.5% | 37 pts |
+| 0.970 | 45.9% | 81.3% | 30.6% | 51 pts |
+| 0.980 | 32.5% | 71.2% | 16.5% | 55 pts |
+| **0.985** | **24.9%** | **65.4%** | **9.1%** | **56 pts** |
+| 0.990 | 17.0% | 56.3% | 2.1% | 54 pts |
 
-Pairs below 0.98 show visible change when you look at them (pedestrians have
-moved, a car has passed). From 0.985 up they are near-identical. The defaults
-are therefore **0.985 for so400m** and **0.98 for the base model**, where its
-gap peaks. Other models fall back to 0.98. Dedup logs the nearest-neighbor
-percentiles on every run, so a new model or dataset can be recalibrated the
-same way.
+Pairs below 0.98 show visible change (pedestrians have moved, a car has
+passed); from 0.985 up they are near-identical. So the defaults are **0.985 for
+so400m** and **0.98 for the base model**, where its gap peaks. Other models
+fall back to 0.98. Dedup logs the nearest-neighbor percentiles on every run, so
+a new model or dataset can be recalibrated the same way.
 
 At the default, the stationary scenes dominate: scene-0553 loses 72% of its
-frames and scene-1100 68%, 55% of all removals between them. scene-0757,
-which stops for its last 22 of 41 keyframes (59% of frames under 0.5 m/s), is
-next at 43%.
+frames and scene-1100 68%, together 56% of all removals. scene-0757, which
+comes to a stop halfway through, is next at 40%.
 
 ## Development
 
 Install the git hook once, so every commit runs ruff, ty and the file checks:
 
 ```bash
-uv run --group dev pre-commit install
+uv run pre-commit install
 ```
 
-The same checks by hand:
+Run every hook by hand:
 
 ```bash
-uv run ruff check
-uv run ruff format --check
-uv run --group dev ty check
-uv run pytest
-uv run --group dev pre-commit run --all-files
+uv run pre-commit run --all-files
 ```
 
-The tests cover the projection math, ego speed, the kNN graph, greedy
-suppression, the dedup CLI end to end on synthetic tables, the SQL prefilter
-builder and the CPU decode stage. They also drive the viewer headlessly with
-`streamlit.testing.v1.AppTest` against `data/lancedb`; those cases skip until
-steps 4 and 5 have run.
+Run the tests with a coverage report:
+
+```bash
+uv run pytest --cov
+```
+
+The tests write small synthetic scenes in nuscenes2mcap's layout and run the
+whole pipeline on them (ingest through Ray, the cluster script, dedup, the
+viewer) with the default model, downloaded on first use. Tests that need
+converted mini or its `data/lancedb` table skip until steps 3, 5 and 6 have
+run.
+
+CI runs the hooks and the tests on every push to `main` and every pull request.
+Each run's summary page shows the coverage table, and the HTML report is
+attached as the `coverage` artifact.
 
 ## Known limitations
 
-- **Center-only projection.** An object counts as visible when its box center
-  lands in the image. A large truck whose center is just off-frame is missed,
-  and a pedestrian fully hidden behind a bus still counts.
+- **Objects count by box corners, not visibility.** The converter logs a box
+  for a camera when any corner lands in the image, with no lidar or radar check.
+  A pedestrian fully hidden behind a bus still counts, and so does a truck
+  whose corner barely clips the frame.
 - **`num_cyclists` counts bicycles and motorcycles, ridden or parked.** It
   follows the category, not the rider: on mini, 61% of these boxes are marked
-  `cycle.without_rider`. The rider attribute is in each annotation's
-  `attribute_tokens` if you need riders only.
+  `cycle.without_rider` in nuScenes. The converter doesn't carry attributes into
+  the MCAP, so riders can't be told apart here.
 - **Night and rain come from the scene description** (a whole-word match), not
-  the pixels. "After rain" counts as rain, and mini has no scene that was
-  actually raining, so rain queries aren't a good showcase on mini.
+  the pixels. "After rain" counts as rain, and no mini scene was actually
+  raining.
 - **kNN-k caps suppression.** A kept frame can only suppress frames in its own
   top-k or frames that have it in their top-k. A stationary stretch much longer
   than k frames therefore splits into several kept frames rather than one.
   Raise `--k` for long stops.
-- **Dark frames embed alike.** Night frames sit closer together in SigLIP space
-  than their content warrants, so night scenes lose somewhat more frames to
-  dedup at the same threshold.
 - **Ego speed is derived from keyframe poses** (a central difference at 2 Hz),
   so short stops and starts are smoothed.
-- **Trainval loads its JSON on the driver.** `sample_data.json` and
-  `ego_pose.json` take a few GB of RAM for v1.0-trainval.
+- **Each MCAP file is read twice.** MCAP interleaves topics within chunks, so
+  reading just the poses and annotations still decompresses the whole file, and
+  `read_mcap` then reads it again for the images.
 
-## Follow-ups (not in scope)
+## Follow-ups
 
 - Swap the embedding stage for a [Geneva](https://lancedb.com/docs/geneva/) UDF,
   so re-embedding with a new model is a column backfill rather than a re-ingest.
-- An MCAP ingest path: nuScenes → MCAP with Foxglove's converter, then
-  `ray.data.read_mcap` into the same schema.
+- Ingest the camera sweeps too (12 Hz instead of 2 Hz), for a denser
+  near-duplicate problem. They carry no annotations.

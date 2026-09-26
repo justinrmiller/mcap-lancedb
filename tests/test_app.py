@@ -1,11 +1,10 @@
 """Headless tests for the Streamlit viewer.
 
-The AppTest cases drive the real app against the table at ``MCAP_LANCEDB_DB``
-(default ``data/lancedb``) and are skipped until ingest and dedup have run.
+The AppTest cases drive the real app against the synthetic pipeline table, and
+again against ``data/lancedb`` when ingest and dedup have run on nuScenes mini.
 """
 
 import io
-import os
 from pathlib import Path
 
 import lancedb
@@ -23,14 +22,12 @@ from mcap_lancedb.app import (
     load_catalog,
     suppress_at,
 )
+from mcap_lancedb.embed import SiglipEncoder
 
-APP = Path(__file__).parents[1] / "src" / "mcap_lancedb" / "app.py"
-DB = Path(os.environ.get("MCAP_LANCEDB_DB", "data/lancedb"))
+REPO = Path(__file__).parents[1]
+APP = REPO / "src" / "mcap_lancedb" / "app.py"
+MINI_DB = REPO / "data" / "lancedb"
 TIMEOUT_S = 300
-
-needs_table = pytest.mark.skipif(
-    not (DB / "frames.lance").exists(), reason="run mcap-lancedb-ingest first"
-)
 
 
 def where_for_locations(locations: list[str]) -> str | None:
@@ -86,15 +83,37 @@ def test_app_without_a_table_says_which_command_to_run(
 
 
 @pytest.fixture
-def app(monkeypatch: pytest.MonkeyPatch) -> AppTest:
-    """Run the viewer once against the real table."""
-    monkeypatch.setenv("MCAP_LANCEDB_DB", str(DB))
+def mini_db() -> Path:
+    """The nuScenes mini table, or a skip if it hasn't been built."""
+    if not (MINI_DB / f"{TABLE_NAME}.lance").exists():
+        pytest.skip("run mcap-lancedb-ingest and mcap-lancedb-dedup on mini first")
+    return MINI_DB
+
+
+@pytest.fixture(params=["synthetic", "mini"])
+def viewer_db(request: pytest.FixtureRequest) -> Path:
+    """The synthetic pipeline table, then the mini table when there is one."""
+    return request.getfixturevalue(
+        "pipeline_db" if request.param == "synthetic" else "mini_db"
+    )
+
+
+def start_viewer(db: Path, monkeypatch: pytest.MonkeyPatch) -> AppTest:
+    """Run the viewer once against a table."""
+    monkeypatch.setenv("MCAP_LANCEDB_DB", str(db))
     started = AppTest.from_file(str(APP), default_timeout=TIMEOUT_S).run()
     assert not started.exception
     return started
 
 
-@needs_table
+@pytest.fixture
+def app(
+    viewer_db: Path, shared_encoder: SiglipEncoder, monkeypatch: pytest.MonkeyPatch
+) -> AppTest:
+    """The viewer on each table, reusing the test session's encoder."""
+    return start_viewer(viewer_db, monkeypatch)
+
+
 def test_text_search_renders_results(app: AppTest) -> None:
     """A typed query fills the grid with thumbnails."""
     app.text_input(key="query").input("a bus at a bus stop").run()
@@ -103,7 +122,6 @@ def test_text_search_renders_results(app: AppTest) -> None:
     assert any(b.key and b.key.startswith("like-") for b in app.button)
 
 
-@needs_table
 def test_example_query_fills_the_query_box(app: AppTest) -> None:
     """Choosing an example copies it into the query and searches."""
     app.pills(key="example").set_value(EXAMPLE_QUERIES[0]).run()
@@ -111,7 +129,6 @@ def test_example_query_fills_the_query_box(app: AppTest) -> None:
     assert app.text_input(key="query").value == EXAMPLE_QUERIES[0]
 
 
-@needs_table
 def test_filters_and_hide_duplicates(app: AppTest) -> None:
     """Prefiltered search runs with every filter set."""
     app.text_input(key="query").input("pedestrians on a crosswalk").run()
@@ -122,7 +139,6 @@ def test_filters_and_hide_duplicates(app: AppTest) -> None:
     assert not app.exception
 
 
-@needs_table
 def test_more_like_this_and_full_resolution(app: AppTest) -> None:
     """Image search and the full-resolution dialog both run cleanly."""
     app.text_input(key="query").input("parking lot with parked cars").run()
@@ -136,29 +152,33 @@ def test_more_like_this_and_full_resolution(app: AppTest) -> None:
     assert not app.exception
 
 
-@needs_table
-def test_threshold_slider_recomputes_removals(app: AppTest) -> None:
-    """Moving the threshold re-runs suppression and redraws the tab."""
+def test_threshold_slider_recomputes_removals(
+    mini_db: Path, shared_encoder: SiglipEncoder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving the threshold re-runs suppression and redraws the tab.
+
+    Mini only: whether 0.95 removes more depends on the data.
+    """
+    app = start_viewer(mini_db, monkeypatch)
     removed_before = app.metric[2].value
     app.slider(key="threshold").set_value(0.95).run()
     assert not app.exception
     assert app.metric[2].value != removed_before
 
 
-@needs_table
-def test_viewer_reproduces_dedup_at_the_stored_threshold() -> None:
+def test_viewer_reproduces_dedup_at_the_stored_threshold(viewer_db: Path) -> None:
     """At dedup's own threshold, the slider's re-run marks exactly what dedup did.
 
     The viewer and the CLI build their visit order from different sources
     (pandas and Arrow), so this pins that they agree frame for frame.
     """
-    table = lancedb.connect(DB).open_table(TABLE_NAME)
+    table = lancedb.connect(viewer_db).open_table(TABLE_NAME)
     stored = (table.schema.metadata or {}).get(META_DEDUP_THRESHOLD.encode())
     if stored is None:
         pytest.skip("run mcap-lancedb-dedup first")
     version = table.version
-    frame_ids = load_catalog(str(DB), version)["frame_id"].to_numpy()
-    dup_of = suppress_at(str(DB), version, float(stored))
+    frame_ids = load_catalog(str(viewer_db), version)["frame_id"].to_numpy()
+    dup_of = suppress_at(str(viewer_db), version, float(stored))
 
     marked = (
         table.to_lance()
@@ -171,7 +191,7 @@ def test_viewer_reproduces_dedup_at_the_stored_threshold() -> None:
     ]
 
 
-def make_viewer_table(root: Path) -> None:
+def make_viewer_table(root: Path, model: str | None = "test-model") -> None:
     """Create an 8-frame table the viewer can open without a model or dataset.
 
     f1 and f2 are near-copies of f0 (cosine 0.990 and 0.958); the rest are
@@ -202,7 +222,9 @@ def make_viewer_table(root: Path) -> None:
                 pa.array(vectors.ravel(), pa.float32()), 8
             ),
         }
-    ).replace_schema_metadata({META_EMBEDDING_MODEL: "test-model"})
+    )
+    if model is not None:
+        table = table.replace_schema_metadata({META_EMBEDDING_MODEL: model})
     lancedb.connect(root).create_table(TABLE_NAME, table)
 
 
@@ -244,3 +266,70 @@ def test_edge_similarity_reads_either_direction() -> None:
     )
     with pytest.raises(ValueError, match="not neighbors"):
         edge_similarity(np.array([[1], [0], [0]]), similarities, frame=2, kept=1)
+
+
+def start_on_viewer_table(
+    root: Path, monkeypatch: pytest.MonkeyPatch, model: str | None = "test-model"
+) -> AppTest:
+    """Run the viewer once on a fresh 8-frame table."""
+    make_viewer_table(root, model)
+    return start_viewer(root, monkeypatch)
+
+
+def infos(app: AppTest) -> str:
+    """Every info box's text, joined."""
+    return "\n".join(str(box.value) for box in app.info)
+
+
+def test_viewer_before_dedup_explains_how_to_mark_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without dedup, the tab says what to run and the filter can't be turned on."""
+    app = start_on_viewer_table(tmp_path, monkeypatch)
+    assert "haven't been marked yet" in infos(app)
+    assert app.toggle[0].disabled
+
+
+def test_viewer_rejects_a_table_without_its_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Text queries can't be embedded to match an unknown model, so say so."""
+    app = start_on_viewer_table(tmp_path, monkeypatch, model=None)
+    assert not app.exception
+    assert "doesn't record its embedding model" in app.error[0].value
+
+
+def test_image_search_recovers_from_a_missing_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A "more like this" frame that's gone (say, after re-ingest) resets search."""
+    app = start_on_viewer_table(tmp_path, monkeypatch)
+    app.session_state["anchor"] = "gone"
+    app.run()
+    assert not app.exception
+    assert app.session_state["anchor"] is None
+
+
+def test_image_search_with_no_matches_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Filters that exclude every frame explain why the grid is empty."""
+    app = start_on_viewer_table(tmp_path, monkeypatch)
+    app.session_state["anchor"] = "f0"
+    app.segmented_control[0].set_value("Night")
+    app.run()
+    assert not app.exception
+    assert "No frames match these filters" in infos(app)
+
+
+def test_threshold_that_removes_nothing_shows_no_clusters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Above every pair's similarity, the clusters section says so."""
+    make_viewer_table(tmp_path)
+    dedup.main(["--db", str(tmp_path), "--device", "cpu", "--threshold", "0.98"])
+    app = start_viewer(tmp_path, monkeypatch)
+    app.slider(key="threshold").set_value(0.999).run()
+    assert not app.exception
+    assert app.metric[2].value == "0.0%"
+    assert "Nothing is removed at this threshold" in infos(app)

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from mcap_lancedb import (
+    DEFAULT_MODEL,
     META_DEDUP_K,
     META_DEDUP_THRESHOLD,
     META_EMBEDDING_MODEL,
@@ -16,6 +17,7 @@ from mcap_lancedb import (
     dedup,
 )
 from mcap_lancedb.dedup import (
+    default_threshold,
     graph_from_columns,
     greedy_suppress,
     knn_graph,
@@ -181,3 +183,42 @@ def test_graph_from_columns_rejects_unknown_neighbors() -> None:
             pa.array([["b"], ["gone"]]),
             pa.array([[0.9], [0.9]], pa.list_(pa.float32())),
         )
+
+
+def test_dedup_collapses_a_stationary_stream(pipeline_db: Path) -> None:
+    """On the pipeline table, a camera that sees the same image keeps one frame.
+
+    scene-0002 stands still and repeats one image per camera. Other merges
+    depend on the model, so only these streams have a fixed answer.
+    """
+    table = lancedb.connect(pipeline_db).open_table(TABLE_NAME)
+    frames = (
+        table.to_lance()
+        .to_table(columns=["frame_id", "scene_name", "channel", "dup_of"])
+        .to_pylist()
+    )
+    kept = {frame["frame_id"] for frame in frames if frame["dup_of"] is None}
+    assert all(frame["dup_of"] in kept for frame in frames if frame["dup_of"])
+    for channel in ("CAM_FRONT", "CAM_BACK"):
+        stream = [
+            frame
+            for frame in frames
+            if frame["scene_name"] == "scene-0002" and frame["channel"] == channel
+        ]
+        assert len(stream) == 3
+        assert sum(frame["dup_of"] is None for frame in stream) <= 1
+    stored = table.schema.metadata[META_DEDUP_THRESHOLD.encode()]
+    assert float(stored) == default_threshold(DEFAULT_MODEL)
+
+
+def test_dedup_cli_without_a_table_says_to_ingest(tmp_path: Path) -> None:
+    """An empty database fails with the command to run first, not a traceback."""
+    with pytest.raises(SystemExit, match="Run mcap-lancedb-ingest first"):
+        dedup.main(["--db", str(tmp_path), "--device", "cpu"])
+
+
+def test_dedup_cli_rejects_an_empty_table(tmp_path: Path) -> None:
+    """A table with no frames has nothing to compare."""
+    make_frames_table(tmp_path, np.zeros((0, 4), dtype=np.float32), objects=[])
+    with pytest.raises(SystemExit, match="is empty"):
+        dedup.main(["--db", str(tmp_path), "--device", "cpu"])

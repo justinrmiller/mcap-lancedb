@@ -11,5 +11,8 @@ dist/
 build/
 *.egg-info/
 .coverage
+coverage.xml
+coverage.svg
+htmlcov/
 .DS_Store
 .claude/settings.local.json

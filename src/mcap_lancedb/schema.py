@@ -1,14 +1,12 @@
 """Arrow schema for the ``frames`` table.
 
 One row per camera keyframe, fully denormalized. The schema is built up in three
-stages that mirror the pipeline: metadata from the JSON tables (driver), media
+stages that mirror the pipeline: metadata from the MCAP files (driver), media
 (CPU stage), then the embedding (GPU stage). The dedup columns are merged in
 later by ``mcap-lancedb-dedup``.
 """
 
 import pyarrow as pa
-
-from mcap_lancedb import META_NUSCENES_VERSION
 
 EMBEDDING_COLUMN = "embedding"
 IMAGE_COLUMN = "image"
@@ -21,13 +19,13 @@ MODEL_INPUT_COLUMN = "_model_input"
 
 METADATA_SCHEMA = pa.schema(
     [
-        # IDs and provenance. frame_id is the sample_data token.
+        # IDs and provenance. frame_id is scene/channel/capture time in µs.
         ("frame_id", pa.string()),
-        ("sample_token", pa.string()),
-        ("scene_token", pa.string()),
         ("scene_name", pa.string()),
-        # Relative to --dataroot, so the table survives moving the dataset.
+        # The scene's MCAP file, relative to --mcap-dir, and the log time of
+        # this frame's image message in it.
         ("source_path", pa.string()),
+        ("mcap_log_time", pa.int64()),
         # Scene context, copied onto every frame because LanceDB has no joins.
         ("scene_description", pa.string()),
         ("scene_tags", pa.list_(pa.string())),
@@ -43,11 +41,11 @@ METADATA_SCHEMA = pa.schema(
         ("width", pa.int32()),
         ("height", pa.int32()),
         ("cam_intrinsic", pa.list_(pa.float32(), 9)),
-        # Ego pose at the camera timestamp. Rotation is [w, x, y, z].
+        # Ego pose at the keyframe. Rotation is [w, x, y, z].
         ("ego_translation", pa.list_(pa.float64(), 3)),
         ("ego_rotation", pa.list_(pa.float64(), 4)),
         ("ego_speed_mps", pa.float32()),
-        # Objects whose annotated center projects into this camera's image.
+        # Annotated objects with any box corner inside this camera's image.
         ("visible_categories", pa.list_(pa.string())),
         ("num_visible_objects", pa.int32()),
         ("num_pedestrians", pa.int32()),
@@ -72,18 +70,6 @@ DEDUP_FIELDS: tuple[pa.Field, ...] = (
     pa.field("dup_of", pa.string()),
 )
 DEDUP_COLUMNS: tuple[str, ...] = tuple(field.name for field in DEDUP_FIELDS)
-
-
-def metadata_schema(version: str) -> pa.Schema:
-    """Schema of the driver-built metadata table, tagged with the dataset version.
-
-    Args:
-        version: nuScenes version, for example ``v1.0-mini``.
-
-    Returns:
-        ``METADATA_SCHEMA`` with the version in its table-level metadata.
-    """
-    return METADATA_SCHEMA.with_metadata({META_NUSCENES_VERSION: version})
 
 
 def embedding_field(dim: int) -> pa.Field:

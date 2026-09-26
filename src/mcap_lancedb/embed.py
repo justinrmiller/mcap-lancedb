@@ -50,12 +50,13 @@ class ImageInputSpec:
 
 def _input_spec(image_processor: Any) -> ImageInputSpec:  # noqa: ANN401
     """Read the input size and resampling filter from an image processor."""
-    size = image_processor.size
-    height, width = size["height"], size["width"]
+    # NaFlex processors have no fixed size at all: ``size`` is None.
+    size = image_processor.size or {}
+    height, width = size.get("height"), size.get("width")
     if not height or not width:
         msg = (
-            f"Expected a fixed-resolution checkpoint, got image size {size}. "
-            "NaFlex checkpoints are not supported."
+            "Expected a fixed-resolution checkpoint, got image size "
+            f"{image_processor.size}. NaFlex checkpoints are not supported."
         )
         raise ValueError(msg)
     # SigLIP 2 squashes with bilinear, SigLIP 1 with bicubic, so this is read

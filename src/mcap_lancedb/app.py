@@ -459,17 +459,17 @@ def render_filters(catalog: pd.DataFrame, dedup_threshold: float | None) -> str 
     )
 
 
-def render_result_card(row: dict[str, Any], show_score: bool) -> None:
+def render_result_card(row: dict[str, Any]) -> None:
     """Draw one search result with its actions."""
     frame_id = row["frame_id"]
     camera = camera_label(row["channel"])
     with st.container(border=True):
         st.image(row[THUMBNAIL_COLUMN], width="stretch")
         st.markdown(f"**{row['scene_name']}**, {camera.lower()} camera")
-        details = f"Ego speed {row['ego_speed_mps']:.1f} m/s"
-        if show_score:
-            details = f"Similarity {row['similarity']:.3f}  \n{details}"
-        st.markdown(details)
+        st.markdown(
+            f"Similarity {row['similarity']:.3f}  \n"
+            f"Ego speed {row['ego_speed_mps']:.1f} m/s"
+        )
         st.caption(row["scene_description"])
         # Stacked, not side by side: a quarter-width card truncates two labels.
         st.button(
@@ -502,7 +502,7 @@ def render_results(results: pd.DataFrame) -> None:
         batch = records[start : start + GRID_COLUMNS]
         for column, row in zip(columns, batch, strict=False):
             with column:
-                render_result_card(row, show_score=True)
+                render_result_card(row)
 
 
 def anchor_vector(table: lancedb.table.Table, frame_id: str) -> np.ndarray:
@@ -786,7 +786,7 @@ def main() -> None:
     if table is None:
         st.info(
             f"There is no {TABLE_NAME} table in `{path}` yet. Create it with "
-            "`uv run mcap-lancedb-ingest --dataroot data/nuscenes`."
+            "`uv run mcap-lancedb-ingest`."
         )
         return
 

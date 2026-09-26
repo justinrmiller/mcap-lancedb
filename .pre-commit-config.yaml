@@ -1,10 +1,10 @@
 # Install the git hook once with:
 #
-#   uv run --group dev pre-commit install
+#   uv run pre-commit install
 #
 # and run every hook across the repo with:
 #
-#   uv run --group dev pre-commit run --all-files
+#   uv run pre-commit run --all-files
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -33,7 +33,7 @@ repos:
     hooks:
       - id: ty
         name: ty check
-        entry: uv run --group dev ty check
+        entry: uv run ty check
         language: system
         types: [python]
         pass_filenames: false

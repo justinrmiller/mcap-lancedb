@@ -8,6 +8,8 @@ requires-python = ">=3.12"
 dependencies = [
     "lancedb>=0.39.0",
     "lancedb-ray>=0.1.1",
+    "mcap>=1.5.0",
+    "mcap-protobuf-support>=0.5.4",
     "numpy>=2.5.3",
     "pandas>=3.0.6",
     "pillow>=12.3.0",
@@ -29,8 +31,10 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "foxglove-sdk>=0.27.0",
     "pre-commit>=4.6.0",
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "ruff>=0.16.9",
     "ty>=0.0.84",
 ]
@@ -53,3 +57,14 @@ known-first-party = ["mcap_lancedb"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["mcap_lancedb"]
+branch = true
+
+[tool.coverage.report]
+# A few points under the measured total, so a regression fails CI.
+fail_under = 97
+show_missing = true
+skip_covered = true
+exclude_also = ['if __name__ == "__main__":']
