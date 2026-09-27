@@ -18,8 +18,10 @@ from mcap_lancedb import META_DEDUP_THRESHOLD, META_EMBEDDING_MODEL, TABLE_NAME,
 from mcap_lancedb.app import (
     EXAMPLE_QUERIES,
     build_where,
+    db_path,
     edge_similarity,
     load_catalog,
+    snapshot_of,
     suppress_at,
 )
 from mcap_lancedb.embed import SiglipEncoder
@@ -176,15 +178,12 @@ def test_viewer_reproduces_dedup_at_the_stored_threshold(viewer_db: Path) -> Non
     stored = (table.schema.metadata or {}).get(META_DEDUP_THRESHOLD.encode())
     if stored is None:
         pytest.skip("run mcap-lancedb-dedup first")
-    version = table.version
-    frame_ids = load_catalog(str(viewer_db), version)["frame_id"].to_numpy()
-    dup_of = suppress_at(str(viewer_db), version, float(stored))
+    dataset = table.to_lance()
+    snapshot = snapshot_of(str(viewer_db), dataset)
+    frame_ids = load_catalog(snapshot)["frame_id"].to_numpy()
+    dup_of = suppress_at(snapshot, float(stored))
 
-    marked = (
-        table.to_lance()
-        .checkout_version(version)
-        .to_table(columns=["frame_id", "dup_of"])
-    )
+    marked = dataset.to_table(columns=["frame_id", "dup_of"])
     assert marked.column("frame_id").to_pylist() == frame_ids.tolist()
     assert marked.column("dup_of").to_pylist() == [
         frame_ids[i] if i >= 0 else None for i in dup_of
@@ -252,6 +251,40 @@ def test_threshold_slider_follows_a_dedup_rerun(
     assert app.metric[2].value == "25.0%"
     # Only the cameras the table holds are offered as filters.
     assert app.multiselect[0].options == ["Front"]
+
+
+def test_viewer_follows_a_reingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recreated table at the same version number isn't served from cache.
+
+    Ingest drops and recreates the table, so its version numbers restart, and
+    the same steps reach the same version again.
+    """
+    make_viewer_table(tmp_path)
+    run_dedup = ["--db", str(tmp_path), "--device", "cpu", "--threshold"]
+    dedup.main([*run_dedup, "0.98"])
+    app = start_viewer(tmp_path, monkeypatch)
+    before = lancedb.connect(tmp_path).open_table(TABLE_NAME).version
+    assert app.metric[2].value == "12.5%"
+
+    lancedb.connect(tmp_path).drop_table(TABLE_NAME)
+    make_viewer_table(tmp_path)
+    dedup.main([*run_dedup, "0.95"])
+    assert lancedb.connect(tmp_path).open_table(TABLE_NAME).version == before
+    app.run()
+    assert not app.exception
+    assert app.slider(key="threshold").value == pytest.approx(0.95)
+    assert app.metric[2].value == "25.0%"
+
+
+def test_db_path_keeps_uris_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An object-store URI reaches LanceDB with its "//" intact."""
+    monkeypatch.setattr("sys.argv", ["app.py"])
+    monkeypatch.setenv("MCAP_LANCEDB_DB", "s3://bucket/lancedb")
+    assert db_path() == "s3://bucket/lancedb"
+    monkeypatch.setattr("sys.argv", ["app.py", "--db", "gs://bucket/db"])
+    assert db_path() == "gs://bucket/db"
 
 
 def test_edge_similarity_reads_either_direction() -> None:

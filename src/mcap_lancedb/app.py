@@ -15,8 +15,7 @@ import os
 import sys
 from collections.abc import Sequence
 from datetime import timedelta
-from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import lance
 import lancedb
@@ -140,7 +139,8 @@ def db_path() -> str:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--db", default=os.environ.get("MCAP_LANCEDB_DB"))
     known, _ = parser.parse_known_args(sys.argv[1:])
-    return str(Path(known.db or DEFAULT_DB))
+    # Not through pathlib, which would collapse the "//" in s3://bucket/lancedb.
+    return known.db or str(DEFAULT_DB)
 
 
 @st.cache_resource
@@ -161,10 +161,44 @@ def open_table(path: str) -> lancedb.table.Table | None:
     return db.open_table(TABLE_NAME)
 
 
-def dataset_at(path: str, version: int) -> lance.LanceDataset:
-    """Open the table's Lance dataset pinned to one version."""
-    table = connect(path).open_table(TABLE_NAME)
-    return table.to_lance().checkout_version(version)
+class Snapshot(NamedTuple):
+    """One commit of the frames table, used as the cache key for its data.
+
+    Ingest drops and recreates the table, which starts its version numbers
+    again from 1, so a path and version can name two different tables. The id
+    of the transaction that made the version can't.
+
+    Attributes:
+        path: Database path or URI.
+        version: Table version.
+        commit: Id of the transaction that made this version.
+    """
+
+    path: str
+    version: int
+    commit: str
+
+
+def snapshot_of(path: str, dataset: lance.LanceDataset) -> Snapshot:
+    """Identify the version a dataset is at.
+
+    Args:
+        path: Database path or URI.
+        dataset: The frames table's Lance dataset.
+
+    Returns:
+        The snapshot. Its commit is empty if the version has no transaction
+        file, which only tables written by old Lance releases lack.
+    """
+    transaction = dataset.read_transaction(dataset.version)
+    commit = transaction.uuid if transaction is not None else ""
+    return Snapshot(path, dataset.version, commit)
+
+
+def dataset_at(snapshot: Snapshot) -> lance.LanceDataset:
+    """Open the table's Lance dataset pinned to a snapshot's version."""
+    table = connect(snapshot.path).open_table(TABLE_NAME)
+    return table.to_lance().checkout_version(snapshot.version)
 
 
 @st.cache_resource(show_spinner="Loading the embedding model")
@@ -177,32 +211,30 @@ def load_encoder(model_id: str) -> SiglipEncoder:
 
 
 @st.cache_data(show_spinner="Reading frame metadata")
-def load_catalog(path: str, version: int) -> pd.DataFrame:
+def load_catalog(snapshot: Snapshot) -> pd.DataFrame:
     """Load the light metadata columns for every frame.
 
     Args:
-        path: Database path.
-        version: Table version, part of the cache key so a rerun of dedup or
-            ingest invalidates it.
+        snapshot: The table version to read. A rerun of dedup or ingest
+            makes a new one, so it's never served from the cache.
 
     Returns:
         One row per frame, in table order.
     """
-    return dataset_at(path, version).to_table(columns=CATALOG_COLUMNS).to_pandas()
+    return dataset_at(snapshot).to_table(columns=CATALOG_COLUMNS).to_pandas()
 
 
 @st.cache_data(show_spinner="Reading the neighbor graph")
-def load_graph(path: str, version: int) -> tuple[np.ndarray, np.ndarray]:
+def load_graph(snapshot: Snapshot) -> tuple[np.ndarray, np.ndarray]:
     """Load the stored kNN graph as positions into the catalog's row order.
 
     Args:
-        path: Database path.
-        version: Table version, for cache invalidation.
+        snapshot: The table version to read.
 
     Returns:
         ``(indices, similarities)``, each of shape ``(n, k)``.
     """
-    graph_table = dataset_at(path, version).to_table(
+    graph_table = dataset_at(snapshot).to_table(
         columns=["frame_id", "nn_frame_ids", "nn_similarity"]
     )
     graph = graph_from_columns(
@@ -214,20 +246,19 @@ def load_graph(path: str, version: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 @st.cache_data(show_spinner="Removing near-duplicates")
-def suppress_at(path: str, version: int, threshold: float) -> np.ndarray:
+def suppress_at(snapshot: Snapshot, threshold: float) -> np.ndarray:
     """Re-run greedy suppression on the stored graph at a new threshold.
 
     Args:
-        path: Database path.
-        version: Table version, for cache invalidation.
+        snapshot: The table version whose graph to use.
         threshold: Cosine similarity for a near-duplicate.
 
     Returns:
         For each frame, the catalog position of the frame that suppressed it,
         or ``-1`` if kept.
     """
-    catalog = load_catalog(path, version)
-    indices, similarities = load_graph(path, version)
+    catalog = load_catalog(snapshot)
+    indices, similarities = load_graph(snapshot)
     order = suppression_order(
         catalog["num_visible_objects"].to_numpy(),
         catalog["timestamp"].to_numpy(),
@@ -731,8 +762,7 @@ def render_dedup_tab(
     table: lancedb.table.Table,
     *,
     catalog: pd.DataFrame,
-    path: str,
-    version: int,
+    snapshot: Snapshot,
     model_id: str,
     stored_threshold: float | None,
 ) -> None:
@@ -746,9 +776,9 @@ def render_dedup_tab(
     # A keyed slider keeps its position across reruns and ignores a changed
     # default, so after dedup reruns it would still show the old threshold.
     # Move it to the stored value whenever the table itself changes.
-    if st.session_state.get("threshold_source") != (path, version):
+    if st.session_state.get("threshold_source") != snapshot:
         st.session_state.threshold = stored_threshold
-        st.session_state.threshold_source = (path, version)
+        st.session_state.threshold_source = snapshot
     threshold = st.slider(
         "Near-duplicate threshold",
         key="threshold",
@@ -768,9 +798,9 @@ def render_dedup_tab(
         "Moving the slider re-runs greedy suppression on the stored neighbor "
         "graph. Nothing in the table changes."
     )
-    dup_of = suppress_at(path, version, threshold)
+    dup_of = suppress_at(snapshot, threshold)
     render_dedup_summary(catalog, dup_of >= 0)
-    render_clusters(table, catalog, dup_of, load_graph(path, version))
+    render_clusters(table, catalog, dup_of, load_graph(snapshot))
 
 
 def main() -> None:
@@ -790,8 +820,11 @@ def main() -> None:
         )
         return
 
-    version = table.version
-    schema = table.schema
+    # One version for the whole run, so the schema, the threshold and the
+    # cached data all describe the same commit even if dedup is running.
+    dataset = table.to_lance()
+    snapshot = snapshot_of(path, dataset)
+    schema = dataset.schema
     metadata = schema.metadata or {}
     model = metadata.get(META_EMBEDDING_MODEL.encode())
     if model is None:
@@ -803,13 +836,14 @@ def main() -> None:
         return
     model_id = model.decode()
 
-    # The threshold alone isn't proof: a failed rerun of dedup can leave the
-    # metadata behind after dropping the columns.
+    # Dedup clears the threshold before replacing its columns and records it
+    # last, so a stored threshold describes the columns beside it. Checking for
+    # the columns as well covers tables changed some other way.
     stored = metadata.get(META_DEDUP_THRESHOLD.encode())
     columns_present = all(name in schema.names for name in DEDUP_COLUMNS)
     dedup_threshold = float(stored) if stored is not None and columns_present else None
 
-    catalog = load_catalog(path, version)
+    catalog = load_catalog(snapshot)
     render_header(catalog, model_id)
     search_tab, dedup_tab = st.tabs(["Search", "Near-duplicates"])
     with search_tab:
@@ -818,8 +852,7 @@ def main() -> None:
         render_dedup_tab(
             table,
             catalog=catalog,
-            path=path,
-            version=version,
+            snapshot=snapshot,
             model_id=model_id,
             stored_threshold=dedup_threshold,
         )

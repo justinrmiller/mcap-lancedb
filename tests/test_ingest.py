@@ -3,6 +3,7 @@
 import io
 import runpy
 from pathlib import Path
+from typing import Any
 
 import foxglove
 import lancedb
@@ -22,13 +23,14 @@ from mcap_lancedb import (
     TABLE_NAME,
 )
 from mcap_lancedb.embed import SiglipEncoder, image_input_spec
-from mcap_lancedb.ingest import embedding_actor_plan, main
+from mcap_lancedb.ingest import embedding_actor_plan, main, parse_args
 from mcap_lancedb.mcap_io import build_frame_records, image_topic, read_scene
 from mcap_lancedb.pipeline import (
     EmbedFrames,
     IngestConfig,
     create_indexes,
     decode_frames,
+    load_encoder_device,
     read_scene_table,
     run,
 )
@@ -207,6 +209,59 @@ def test_ingest_without_mcap_files_says_how_to_get_them(tmp_path: Path) -> None:
         main(["--mcap-dir", str(tmp_path), "--db", str(tmp_path / "db")])
 
 
+def test_ingest_cli_keeps_uris_and_resolves_paths() -> None:
+    """A URI --db stays as given; a local one becomes absolute for Ray workers."""
+    assert parse_args(["--db", "s3://bucket/lancedb"]).db == "s3://bucket/lancedb"
+    assert parse_args(["--db", "rel/db"]).db == str(Path("rel/db").resolve())
+    assert Path(parse_args([]).db).is_absolute()
+
+
+@pytest.mark.parametrize(
+    "argv", [["--limit", "0"], ["--limit", "-5"], ["--batch-size", "0"]]
+)
+def test_ingest_cli_rejects_bad_numbers(argv: list[str]) -> None:
+    """Out-of-range numbers fail at parse time, not as "no keyframes" later."""
+    with pytest.raises(SystemExit):
+        parse_args(argv)
+
+
+@pytest.mark.parametrize(
+    ("settings", "error"),
+    [
+        # Ray sees no GPUs here, so a one-GPU actor can never be placed.
+        ({"gpus_per_actor": 1, "startup_timeout_s": 2}, "couldn't fit"),
+        # Fails on the device, before any model weights are needed.
+        ({"device": "cuda:99"}, "failed to load"),
+    ],
+)
+def test_pipeline_keeps_the_table_when_actors_cant_start(
+    synthetic_mcap: SyntheticMcap,
+    tmp_path: Path,
+    settings: dict[str, Any],
+    error: str,
+) -> None:
+    """A pool that can't fit, or a model that can't load, leaves the old table."""
+    lancedb.connect(tmp_path).create_table(TABLE_NAME, pa.table({"frame_id": ["old"]}))
+    config = IngestConfig(
+        mcap_uri=str(synthetic_mcap.root), db_uri=str(tmp_path), **settings
+    )
+    ray.init(num_cpus=2, num_gpus=0)
+    try:
+        with pytest.raises(RuntimeError, match=error):
+            run(config)
+    finally:
+        ray.shutdown()
+    table = lancedb.connect(tmp_path).open_table(TABLE_NAME)
+    assert table.to_arrow()["frame_id"].to_pylist() == ["old"]
+
+
+def test_load_encoder_device_reports_where_the_model_runs(
+    shared_encoder: SiglipEncoder,
+) -> None:
+    """The pre-flight load runs in a Ray worker; this covers it in-process."""
+    assert load_encoder_device(DEFAULT_MODEL, None) == str(shared_encoder.device)
+
+
 def test_pipeline_without_mcap_files_raises(tmp_path: Path) -> None:
     """The shared pipeline reports a missing input before starting any work."""
     config = IngestConfig(mcap_uri=str(tmp_path), db_uri=str(tmp_path / "db"))
@@ -272,6 +327,10 @@ def test_pipeline_without_keyframes_raises(tmp_path: Path) -> None:
         ["--mcap-uri", "data/mcap", "--db-uri", "/abs/db"],
         ["--mcap-uri", "/abs/mcap", "--db-uri", "data/lancedb"],
         ["--mcap-uri", "/abs/mcap", "--db-uri", "/abs/db", "--min-gpu-actors", "0"],
+        ["--mcap-uri", "/abs/mcap", "--db-uri", "/abs/db", "--gpus-per-actor", "-1"],
+        ["--mcap-uri", "/abs/mcap", "--db-uri", "/abs/db", "--startup-timeout", "0"],
+        ["--mcap-uri", "/abs/mcap", "--db-uri", "/abs/db", "--limit", "0"],
+        ["--mcap-uri", "/abs/mcap", "--db-uri", "/abs/db", "--batch-size", "0"],
         [
             "--mcap-uri",
             "s3://bucket/mcap",
@@ -285,7 +344,7 @@ def test_pipeline_without_keyframes_raises(tmp_path: Path) -> None:
     ],
 )
 def test_cluster_job_rejects_bad_arguments(argv: list[str]) -> None:
-    """Relative paths and impossible actor bounds fail before Ray starts."""
+    """Relative paths, impossible actor bounds and bad numbers fail early."""
     job = runpy.run_path(str(CLUSTER_SCRIPT))
     with pytest.raises(SystemExit):
         job["parse_args"](argv)
@@ -296,3 +355,22 @@ def test_cluster_job_accepts_uris_and_absolute_paths() -> None:
     job = runpy.run_path(str(CLUSTER_SCRIPT))
     args = job["parse_args"](["--mcap-uri", "gs://b/mcap", "--db-uri", "/abs/db"])
     assert (args.mcap_uri, args.db_uri) == ("gs://b/mcap", "/abs/db")
+    assert args.gpus_per_actor == 1.0
+
+
+def test_cluster_job_accepts_cpu_actors_and_a_longer_wait() -> None:
+    """Zero GPUs per actor and a custom startup timeout are both valid."""
+    job = runpy.run_path(str(CLUSTER_SCRIPT))
+    args = job["parse_args"](
+        [
+            "--mcap-uri",
+            "/abs/mcap",
+            "--db-uri",
+            "/abs/db",
+            "--gpus-per-actor",
+            "0",
+            "--startup-timeout",
+            "1800",
+        ]
+    )
+    assert (args.gpus_per_actor, args.startup_timeout) == (0.0, 1800.0)

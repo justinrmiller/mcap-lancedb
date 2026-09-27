@@ -168,7 +168,7 @@ def read_scene(
     Args:
         handle: The scene's MCAP file, open for binary reading and seekable.
         source_path: The file's name, recorded as each frame's ``source_path``.
-        channels: Camera channels to include.
+        channels: Camera channels to include. A repeated channel counts once.
 
     Returns:
         Records ordered by the order of ``channels``, then by time.
@@ -177,6 +177,8 @@ def read_scene(
         ValueError: If the file has no ``scene-info`` metadata, which means
             nuscenes2mcap didn't write it.
     """
+    # A repeat would emit every frame of that camera twice, under one frame_id.
+    channels = list(dict.fromkeys(channels))
     topics = [TF_TOPIC]
     for channel in channels:
         topics += [f"/{channel.lower()}/camera_info", f"/{channel.lower()}/annotations"]
