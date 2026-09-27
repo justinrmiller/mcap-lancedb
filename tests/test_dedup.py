@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import lance
 import lancedb
 import numpy as np
 import pyarrow as pa
@@ -155,6 +156,57 @@ def test_dedup_cli_marks_merges_and_reruns(tmp_path: Path) -> None:
     assert metadata[META_EMBEDDING_MODEL.encode()] == b"test-model"
     assert metadata[META_DEDUP_THRESHOLD.encode()] == b"0.99"
     assert metadata[META_DEDUP_K.encode()] == b"2"
+
+
+def test_dedup_rerun_that_fails_leaves_no_stale_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If recording the new threshold fails, the old one isn't left behind.
+
+    Otherwise the table would pair the new dup_of with the previous run's
+    threshold, and the viewer would present the one as produced by the other.
+    """
+    embeddings = random_unit_vectors(4, 16, seed=4)
+    make_frames_table(tmp_path, embeddings, objects=[0, 0, 0, 0])
+    args = ["--db", str(tmp_path), "--device", "cpu", "--k", "2", "--threshold"]
+    dedup.main([*args, "0.99"])
+
+    update = lance.LanceDataset.update_schema_metadata
+
+    def fail_to_record(
+        self: lance.LanceDataset,
+        values: dict[str, str | None],
+        *,
+        replace: bool = False,
+    ) -> dict[str, str]:
+        if values.get(META_DEDUP_THRESHOLD) is not None:
+            msg = "disk full"
+            raise OSError(msg)
+        return update(self, values, replace=replace)
+
+    monkeypatch.setattr(lance.LanceDataset, "update_schema_metadata", fail_to_record)
+    with pytest.raises(OSError, match="disk full"):
+        dedup.main([*args, "0.5"])
+
+    frames = read_frames(tmp_path)
+    assert "dup_of" in frames.schema.names
+    metadata = frames.schema.metadata
+    assert META_DEDUP_THRESHOLD.encode() not in metadata
+    assert META_DEDUP_K.encode() not in metadata
+    assert metadata[META_EMBEDDING_MODEL.encode()] == b"test-model"
+
+
+def test_dedup_records_the_exact_threshold(tmp_path: Path) -> None:
+    """The stored threshold parses back to the value that produced dup_of."""
+    make_frames_table(tmp_path, random_unit_vectors(3, 8), objects=[0, 0, 0])
+    dedup.main(["--db", str(tmp_path), "--device", "cpu", "--threshold", "0.98765432"])
+    stored = read_frames(tmp_path).schema.metadata[META_DEDUP_THRESHOLD.encode()]
+    assert float(stored) == 0.98765432
+
+
+def test_dedup_cli_keeps_uris_intact() -> None:
+    """An object-store --db reaches LanceDB with its "//" intact."""
+    assert dedup.parse_args(["--db", "s3://bucket/lancedb"]).db == "s3://bucket/lancedb"
 
 
 def test_dedup_cli_handles_a_single_frame(tmp_path: Path) -> None:

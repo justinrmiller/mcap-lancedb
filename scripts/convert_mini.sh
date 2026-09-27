@@ -4,11 +4,18 @@
 # for example `--scene scene-0061`.
 set -euo pipefail
 
+# Every path below is relative to the repository root, wherever this runs from.
+cd "$(dirname "$0")/.."
+
 converter=data/nuscenes2mcap
 commit=0bcaab269379069b8a2df8ad4762f128c2552bb9
 
 if [ ! -d "$converter" ]; then
     git clone -q https://github.com/foxglove/nuscenes2mcap.git "$converter"
+fi
+# A clone made before the pin last moved may not have the commit yet.
+if ! git -C "$converter" cat-file -e "$commit^{commit}" 2>/dev/null; then
+    git -C "$converter" fetch -q origin
 fi
 git -C "$converter" checkout -q "$commit"
 

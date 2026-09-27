@@ -22,6 +22,7 @@ from mcap_lancedb import (
     DEFAULT_MCAP_DIR,
     DEFAULT_MODEL,
 )
+from mcap_lancedb.cli import positive_int
 from mcap_lancedb.pipeline import WORKER_ENV, IngestConfig, configure_logging, run
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,22 @@ def embedding_actor_plan(device: str, cluster_gpus: int) -> tuple[int, int]:
     return 1, 0
 
 
+def db_location(value: str) -> str:
+    """Keep a URI as given, and make a local path absolute.
+
+    Ray workers run in their own directories, so a relative path would point
+    somewhere else for them. pathlib would also collapse the ``//`` in a URI
+    such as ``s3://bucket/lancedb``, so URIs never go through it.
+
+    Args:
+        value: The raw ``--db`` argument.
+
+    Returns:
+        The URI, or the absolute path.
+    """
+    return value if "://" in value else str(Path(value).resolve())
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments.
 
@@ -64,15 +81,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Embed nuScenes MCAP camera keyframes into a LanceDB table.",
     )
     parser.add_argument("--mcap-dir", type=Path, default=DEFAULT_MCAP_DIR)
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser.add_argument(
+        "--db",
+        type=db_location,
+        default=str(DEFAULT_DB),
+        help="LanceDB directory or URI.",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--channels", nargs="+", choices=CAMERA_CHANNELS, default=list(CAMERA_CHANNELS)
     )
     parser.add_argument(
-        "--batch-size", type=int, default=32, help="Frames per embedding batch."
+        "--batch-size",
+        type=positive_int,
+        default=32,
+        help="Frames per embedding batch.",
     )
-    parser.add_argument("--limit", type=int, help="Ingest only the first N frames.")
+    parser.add_argument(
+        "--limit", type=positive_int, help="Ingest only the first N frames."
+    )
     parser.add_argument(
         "--device", choices=["auto", "cuda", "mps", "cpu"], default="auto"
     )
@@ -91,7 +118,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     configure_logging()
     # Ray workers run in their own directories, so every path they see is
-    # absolute. On a multi-node cluster both must be on shared storage.
+    # absolute (--db is resolved as it's parsed). On a multi-node cluster both
+    # must be on shared storage.
     mcap_dir = args.mcap_dir.resolve()
     if not any(mcap_dir.glob("*.mcap")):
         msg = (
@@ -117,7 +145,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     run(
         IngestConfig(
             mcap_uri=str(mcap_dir),
-            db_uri=str(args.db.resolve()),
+            db_uri=args.db,
             model_id=args.model,
             channels=tuple(args.channels),
             limit=args.limit,

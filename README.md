@@ -128,6 +128,9 @@ uv run mcap-lancedb-ingest --model google/siglip2-base-patch16-224
 
 It finishes with `Wrote 2424 frames to .../data/lancedb/frames`. Rerunning
 ingest replaces the table, dedup results included, so rerun dedup afterwards.
+It only drops the old table once the model has loaded with your `--device` and
+the embedding actors fit, so a typo in `--model` or `--device` leaves it in
+place.
 
 ### 6. Mark near-duplicates
 
@@ -221,11 +224,11 @@ Embeddings from different models aren't comparable.
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--mcap-dir` | `data/mcap` | One nuscenes2mcap file per scene, directly in this directory. |
-| `--db` | `data/lancedb` | LanceDB directory. The table is always named `frames`. |
+| `--db` | `data/lancedb` | LanceDB directory, or a URI such as `s3://bucket/lancedb`. The table is always named `frames`. |
 | `--model` | `google/siglip2-so400m-patch16-384` | `google/siglip2-base-patch16-224` is several times faster. Fixed-resolution SigLIP checkpoints only. |
 | `--device` | `auto` | CUDA, then MPS, then CPU. fp16 on CUDA, fp32 elsewhere. |
-| `--channels` | all six | Any subset of `CAM_FRONT` … `CAM_FRONT_LEFT`. |
-| `--limit` | none | Ingest only the first N frames, in file, camera and time order. |
+| `--channels` | all six | Any subset of `CAM_FRONT` … `CAM_FRONT_LEFT`. A repeated channel counts once. |
+| `--limit` | none | Ingest only the first N frames (N ≥ 1), in file, camera and time order. |
 | `--batch-size` | 32 | Frames per embedding batch. Lower it if the GPU runs out of memory. |
 | `--vector-index` | `auto` | IVF_PQ only at 100k rows or more; `always` or `never` override. |
 
@@ -233,13 +236,13 @@ Embeddings from different models aren't comparable.
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--db` | `data/lancedb` | Same directory as ingest. |
+| `--db` | `data/lancedb` | Same directory or URI as ingest. |
 | `--threshold` | calibrated per model | 0.985 for so400m, 0.98 for base and any other model. Must be in (0, 1]. |
 | `--k` | 32 | Neighbors per frame in the stored graph. Raise it for long stops. |
 | `--device` | `auto` | Where the exact kNN matrix multiplies run. |
 
-The viewer takes `--db` after a `--`, or the `MCAP_LANCEDB_DB` environment
-variable:
+The viewer takes `--db` (a directory or URI) after a `--`, or the
+`MCAP_LANCEDB_DB` environment variable:
 
 ```bash
 uv run streamlit run src/mcap_lancedb/app.py -- --db path/to/lancedb
@@ -282,6 +285,7 @@ uvx --python 3.12 --from "ray[default]==2.58.0" ray stop
 | `--min-gpu-actors` | 1 | Embedding actors kept running. |
 | `--max-gpu-actors` | as many as the cluster's GPUs fit at start | Ray Data adds actors up to this while GPU work is queued. Set it on autoscaling clusters, which may start with no GPUs. |
 | `--gpus-per-actor` | 1 | `0.5` packs two actors per GPU; `0` runs on CPU. |
+| `--startup-timeout` | 600 | Seconds to wait for `--min-gpu-actors` to fit, autoscaling included. After that the job fails and leaves any existing table as it was. |
 | `--batch-size` | 64 | Frames per embedding batch. |
 | `--ray-address` | `auto` | The cluster running the job. `local` starts a throwaway one instead. |
 
@@ -300,6 +304,9 @@ How the work spreads:
 - **Model weights:** each node downloads the model into its Hugging Face cache
   when its first actor starts. Set `HF_HOME` to shared storage to download it
   once.
+- **Before the old table goes:** the job reserves the `--min-gpu-actors` pool
+  in a Ray placement group, which also asks an autoscaler for the GPUs, and
+  loads the model once inside it. Only then does it drop an existing table.
 
 The local CLI can also join a running cluster: set `RAY_ADDRESS`. `--mcap-dir`
 and `--db` must then be on shared storage mounted at the same path on every
@@ -311,8 +318,11 @@ node.
 | --- | --- |
 | `No .mcap files in ...` | Run step 3, or point `--mcap-dir` at the converted scenes. |
 | `... has no scene-info metadata` | The file wasn't written by nuscenes2mcap. Keep only its output in `--mcap-dir`. |
+| `Scenes in more than one MCAP file: ...` | Two files hold the same scene, such as a renamed copy. Keep one file per scene in `--mcap-dir`. |
 | Ray warns the runtime_env package is "approaching the maximum upload size" | Under `uv run`, Ray uploads the current directory to its workers, minus anything in `.gitignore`. Run from the repository root, and keep datasets in `data/` or outside the repo. |
 | Out of memory while embedding | Lower `--batch-size`, or use the base model. |
+| `The cluster couldn't fit N embedding actor(s) ...` | The cluster lacks `--min-gpu-actors` × `--gpus-per-actor` GPUs. Lower either, add GPU nodes, or raise `--startup-timeout` if an autoscaler needs longer. The existing table is untouched. |
+| `... failed to load for embedding` | The cause is printed below it: usually a `--device` the node doesn't have, a wrong `--model`, or a failed download. The existing table is untouched. |
 | `You are sending unauthenticated requests to the HF Hub` | Harmless. Set `HF_TOKEN` for faster downloads and higher rate limits. |
 | The viewer says there's no `frames` table | It reads `data/lancedb` relative to where you launched it. Launch from the repository root, or pass `-- --db PATH`. |
 | *Hide near-duplicates* is greyed out, or the Near-duplicates tab is empty | Run step 6, then reload the page. |
@@ -377,42 +387,14 @@ flowchart TB
 
 ## Schema
 
-One table, `frames`, with one row per camera keyframe.
+One table, `frames`, holds one row per camera keyframe: IDs and provenance,
+scene context, camera calibration, ego pose and speed, the objects in view, a
+thumbnail and the original JPEG, and the SigLIP 2 embedding. Dedup adds each
+frame's nearest neighbors and `dup_of`. Table-level metadata records the
+embedding model, so the viewer always embeds queries with it.
 
-| Group | Columns |
-| --- | --- |
-| IDs and provenance | `frame_id` (scene/channel/capture time in µs), `scene_name`, `source_path` (the scene's MCAP file), `mcap_log_time` (the image message's log time, ns) |
-| Scene context | `scene_description`, `scene_tags`, `is_night`, `is_rain`, `location`, `log_date`, `vehicle` |
-| Camera | `channel`, `timestamp` (capture time, µs, UTC), `frame_index`, `width`, `height`, `cam_intrinsic` (9 × float32) |
-| Ego | `ego_translation` (3 × float64), `ego_rotation` ([w, x, y, z]), `ego_speed_mps` |
-| Objects in this camera | `visible_categories`, `num_visible_objects`, `num_pedestrians`, `num_cyclists`, `num_vehicles` |
-| Media | `thumbnail` (inline JPEG, 320 px long edge, q85), `image` (original JPEG bytes, `large_binary`) |
-| Embedding | `embedding` (`fixed_size_list<float32, D>`, L2-normalized) |
-| Dedup, merged later | `nn_frame_ids`, `nn_similarity` (top-k neighbors), `dup_of` (null means kept) |
-
-Table-level schema metadata records the embedding model, its dimension, and,
-after dedup, the threshold and k. The viewer embeds text queries with the model
-named there, so queries and frames always share a space.
-
-Why it looks like this:
-
-- **Fully denormalized.** LanceDB has no joins, so scene, pose and calibration
-  data are copied onto every frame. A filter like "night frames at
-  singapore-hollandvillage with two or more pedestrians" is one prefilter on
-  one table.
-- **Originals inline, but never read by accident.** `image` is a plain
-  `large_binary` column. Lance reads only the columns a query projects, so
-  searches and scans that leave it out (all of them, apart from the
-  full-resolution view) never pay for it. Grids read the small `thumbnail`
-  column instead.
-- **Near-duplicates are marked, never deleted.** Dedup only adds columns, so
-  "hide near-duplicates" is just `dup_of IS NULL`, and the viewer can re-run
-  suppression at any threshold from the stored graph.
-- **The vector index is conditional.** Below 100k rows an exact search is faster
-  than IVF_PQ and has perfect recall, so `--vector-index auto` skips it. Scalar
-  indexes always exist: BITMAP on `channel` and `location`, BTREE on
-  `scene_name` and on `frame_id`, which is the merge key and the viewer's
-  point-lookup key.
+[SCHEMAS.md](SCHEMAS.md) describes every column, the table metadata and the
+indexes, and explains why the table is laid out this way.
 
 ## Near-duplicate removal
 
@@ -505,6 +487,11 @@ attached as the `coverage` artifact.
   Raise `--k` for long stops.
 - **Ego speed is derived from keyframe poses** (a central difference at 2 Hz),
   so short stops and starts are smoothed.
+- **A re-ingest that fails partway loses the old table.** LanceDB OSS can't
+  rename tables, so ingest can't build the new one alongside and swap it in.
+  It checks what it can first (the actor pool fits, the model loads), but a
+  failure after the drop, such as running out of GPU memory or a storage
+  error, leaves no table. Ingest into a new `--db` when the old table matters.
 - **Each MCAP file is read twice.** MCAP interleaves topics within chunks, so
   reading just the poses and annotations still decompresses the whole file, and
   `read_mcap` then reads it again for the images.

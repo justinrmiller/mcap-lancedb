@@ -4,6 +4,9 @@ One row per camera keyframe, fully denormalized. The schema is built up in three
 stages that mirror the pipeline: metadata from the MCAP files (a Ray task per
 file), media (CPU stage), then the embedding (GPU stage). The dedup columns are
 merged in later by ``mcap-lancedb-dedup``.
+
+SCHEMAS.md at the repository root documents every column; update it with any
+change here.
 """
 
 import pyarrow as pa

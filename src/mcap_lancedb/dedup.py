@@ -13,7 +13,6 @@ import argparse
 import logging
 import time
 from collections.abc import Sequence
-from pathlib import Path
 from typing import NamedTuple
 
 import lance
@@ -32,6 +31,7 @@ from mcap_lancedb import (
     META_EMBEDDING_MODEL,
     TABLE_NAME,
 )
+from mcap_lancedb.cli import positive_int
 from mcap_lancedb.embed import resolve_device
 from mcap_lancedb.schema import DEDUP_COLUMNS, DEDUP_FIELDS, EMBEDDING_COLUMN
 
@@ -223,6 +223,10 @@ def write_dedup_columns(
     Existing dedup columns are dropped first, so reruns replace rather than
     fail. The threshold and k are recorded in the table's schema metadata.
 
+    Each step is its own commit. The old threshold is cleared before anything
+    else and the new one recorded last, so no version of the table pairs a
+    threshold with columns it didn't produce, even if a step fails.
+
     Args:
         dataset: The frames table's Lance dataset.
         frame_ids: Frame ids in the order the graph was built.
@@ -230,6 +234,9 @@ def write_dedup_columns(
         dup_of: Output of ``greedy_suppress``.
         threshold: Threshold that produced ``dup_of``.
     """
+    recorded = dataset.schema.metadata or {}
+    if META_DEDUP_THRESHOLD.encode() in recorded:
+        dataset.update_schema_metadata({META_DEDUP_THRESHOLD: None, META_DEDUP_K: None})
     stale = [name for name in DEDUP_COLUMNS if name in dataset.schema.names]
     if stale:
         dataset.drop_columns(stale)
@@ -252,28 +259,11 @@ def write_dedup_columns(
         schema=pa.schema([pa.field("frame_id", pa.string()), *DEDUP_FIELDS]),
     )
     dataset.merge(columns, left_on="frame_id")
+    # str() is the shortest text that parses back to the same float, so the
+    # viewer's slider starts at exactly the threshold that produced dup_of.
     dataset.update_schema_metadata(
-        {META_DEDUP_THRESHOLD: f"{threshold:g}", META_DEDUP_K: str(k)}
+        {META_DEDUP_THRESHOLD: str(threshold), META_DEDUP_K: str(k)}
     )
-
-
-def positive_int(value: str) -> int:
-    """Parse a command-line integer that must be at least 1.
-
-    Args:
-        value: The raw argument.
-
-    Returns:
-        The parsed integer.
-
-    Raises:
-        argparse.ArgumentTypeError: If the value is below 1.
-    """
-    number = int(value)
-    if number < 1:
-        msg = f"must be at least 1, got {number}"
-        raise argparse.ArgumentTypeError(msg)
-    return number
 
 
 def similarity_threshold(value: str) -> float:
@@ -308,7 +298,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         prog="mcap-lancedb-dedup",
         description="Mark near-duplicate frames in the frames table.",
     )
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    # A plain string: pathlib would collapse the "//" in s3://bucket/lancedb.
+    parser.add_argument(
+        "--db", default=str(DEFAULT_DB), help="LanceDB directory or URI."
+    )
     parser.add_argument(
         "--k", type=positive_int, default=DEFAULT_K, help="Neighbors per frame."
     )

@@ -12,6 +12,10 @@ how Ray starts, and how many embedding actors run.
 4. GPU actors embed the model input with SigLIP 2.
 5. lancedb-ray writes the fragments in parallel and commits them together.
 
+An existing table is replaced only once the minimum pool of embedding actors
+fits on the cluster and the model loads on it, so a wrong device, model id or
+cluster size leaves the old table in place.
+
 The metadata is small (about 0.5 KB per frame), so it goes to every decode task
 through the object store instead of being shuffled against the images.
 """
@@ -28,14 +32,19 @@ from typing import Any
 import lancedb
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.fs as pafs
 import ray
+import torch
 import transformers
 from lancedb.index import Bitmap, BTree, IvfPq
 from lancedb_ray import write_lancedb
 from mcap.records import Schema
 from mcap_protobuf.decoder import DecoderFactory
 from PIL import Image
+from ray.exceptions import GetTimeoutError, RayError
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from mcap_lancedb import (
     CAMERA_CHANNELS,
@@ -46,7 +55,12 @@ from mcap_lancedb import (
     THUMBNAIL_LONG_EDGE,
     THUMBNAIL_QUALITY,
 )
-from mcap_lancedb.embed import ImageInputSpec, SiglipEncoder, image_input_spec
+from mcap_lancedb.embed import (
+    ImageInputSpec,
+    SiglipEncoder,
+    image_input_spec,
+    resolve_device,
+)
 from mcap_lancedb.mcap_io import channel_of, image_topic, read_scene
 from mcap_lancedb.schema import (
     EMBEDDING_COLUMN,
@@ -63,6 +77,10 @@ logger = logging.getLogger(__name__)
 # Below this many rows an exact (brute-force) search is faster than IVF_PQ and
 # has perfect recall, so --vector-index auto skips the index.
 VECTOR_INDEX_MIN_ROWS = 100_000
+
+# How long to wait for the minimum pool of embedding actors to fit, which
+# includes an autoscaler bringing up GPU nodes.
+DEFAULT_STARTUP_TIMEOUT_S = 600.0
 
 # Settings Ray workers need too, not just the driver.
 WORKER_ENV = {"TOKENIZERS_PARALLELISM": "false", "TRANSFORMERS_VERBOSITY": "error"}
@@ -88,6 +106,8 @@ class IngestConfig:
             Ray Data autoscale the pool.
         gpus_per_actor: GPUs each embedding actor reserves.
         vector_index: ``auto``, ``always`` or ``never``.
+        startup_timeout_s: How long to wait for the minimum pool of embedding
+            actors to fit on the cluster before giving up.
     """
 
     mcap_uri: str
@@ -100,6 +120,7 @@ class IngestConfig:
     embed_actors: int | tuple[int, int] = 1
     gpus_per_actor: float = 0
     vector_index: str = "auto"
+    startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S
 
 
 def configure_logging() -> None:
@@ -183,6 +204,29 @@ def read_metadata(
     tables = ray.get([_read_scene_task.remote(filesystem, p, channels) for p in files])
     metadata = pa.concat_tables([METADATA_SCHEMA.empty_table(), *tables])
     return metadata if limit is None else metadata.slice(0, limit)
+
+
+def check_one_file_per_scene(metadata: pa.Table) -> None:
+    """Refuse a scene whose frames come from more than one MCAP file.
+
+    They would be written twice under the same frame_ids, which dedup merges
+    on and the viewer looks frames up by. nuscenes2mcap names each file after
+    its scene, so only a renamed or copied file does this.
+
+    Args:
+        metadata: Output of ``read_metadata``.
+
+    Raises:
+        ValueError: If any scene appears in two or more files.
+    """
+    files = metadata.group_by("scene_name").aggregate(
+        [("source_path", "count_distinct")]
+    )
+    repeated = files.filter(pc.field("source_path_count_distinct") > 1)
+    if repeated.num_rows:
+        names = ", ".join(sorted(repeated["scene_name"].to_pylist()))
+        msg = f"Scenes in more than one MCAP file: {names}. Keep one file per scene."
+        raise ValueError(msg)
 
 
 @functools.cache
@@ -370,6 +414,74 @@ def frames_dataset(
     )
 
 
+def load_encoder_device(model_id: str, device: str | None) -> str:
+    """Load the model the way an embedding actor will, and report its device.
+
+    Args:
+        model_id: Hugging Face model id.
+        device: Explicit device, or ``None`` to pick the best available.
+
+    Returns:
+        The device the model loaded on, for example ``cuda``.
+    """
+    # A device this node doesn't have fails here, before any weights download.
+    torch.empty(0, device=resolve_device(device))
+    return str(SiglipEncoder(model_id, device=device).device)
+
+
+# One call per worker process: the worker exits afterwards and frees its copy of
+# the model before the embedding actors load theirs.
+_load_encoder_task = ray.remote(max_calls=1)(load_encoder_device)
+
+
+def check_embedding_actors(config: IngestConfig) -> str:
+    """Make sure the embedding actors can start, before anything is replaced.
+
+    Reserves the minimum actor pool's resources in a placement group, which
+    also asks an autoscaling cluster for them, then loads the model once inside
+    that reservation, on the actors' device.
+
+    Args:
+        config: Pipeline settings.
+
+    Returns:
+        The device the model loaded on.
+
+    Raises:
+        RuntimeError: If the pool doesn't fit within
+            ``config.startup_timeout_s``, or the model doesn't load.
+    """
+    actors = config.embed_actors
+    minimum = actors[0] if isinstance(actors, tuple) else actors
+    # A GPU actor reserves only its GPUs; a CPU-only one needs at most a CPU.
+    gpus = config.gpus_per_actor
+    bundle = {"GPU": gpus} if gpus else {"CPU": 1.0}
+    unchanged = f"The {TABLE_NAME} table in {config.db_uri} is unchanged."
+    group = placement_group([bundle] * minimum)
+    try:
+        try:
+            ray.get(group.ready(), timeout=config.startup_timeout_s)
+        except GetTimeoutError:
+            msg = (
+                f"The cluster couldn't fit {minimum} embedding actor(s) needing "
+                f"{bundle} each within {config.startup_timeout_s:g}s. {unchanged}"
+            )
+            raise RuntimeError(msg) from None
+        load = _load_encoder_task.options(
+            num_cpus=0 if gpus else 1,
+            num_gpus=gpus,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(group),
+        )
+        try:
+            return ray.get(load.remote(config.model_id, config.device))
+        # RayError also covers a worker killed for running out of memory.
+        except RayError as error:
+            msg = f"{config.model_id} failed to load for embedding. {unchanged}"
+            raise RuntimeError(msg) from error
+    finally:
+        remove_placement_group(group)
+
+
 def create_indexes(table: lancedb.table.Table, vector_index: str) -> None:
     """Create the scalar indexes, and the vector index when it pays off.
 
@@ -405,6 +517,9 @@ def run(config: IngestConfig) -> int:
 
     Raises:
         FileNotFoundError: If there are no MCAP files or no camera keyframes.
+        ValueError: If a scene appears in more than one MCAP file.
+        RuntimeError: If the embedding actors can't start. An existing table
+            is left as it was.
     """
     filesystem, files = list_mcap_files(config.mcap_uri)
     if not files:
@@ -414,11 +529,19 @@ def run(config: IngestConfig) -> int:
     if metadata.num_rows == 0:
         msg = f"No camera keyframes in the MCAP files under {config.mcap_uri}"
         raise FileNotFoundError(msg)
+    check_one_file_per_scene(metadata)
     # With a limit, only read the files that hold the chosen frames.
     wanted = set(metadata["source_path"].to_pylist())
     files = [path for path in files if posixpath.basename(path) in wanted]
     logger.info(
         "Found %d camera keyframes in %d MCAP file(s)", metadata.num_rows, len(files)
+    )
+
+    # Everything up to here leaves an existing table alone; the drop below
+    # doesn't, and the pipeline only runs once it's gone.
+    device = check_embedding_actors(config)
+    logger.info(
+        "%s loads on %s, so the embedding actors can start", config.model_id, device
     )
 
     frames = frames_dataset(config, filesystem, files, metadata)

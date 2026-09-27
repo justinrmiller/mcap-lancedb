@@ -13,6 +13,9 @@ repository root:
 Under ``uv run``, Ray rebuilds the project's locked environment on each worker
 node. Each node downloads the model into its Hugging Face cache the first time
 an actor starts there.
+
+An existing table is replaced only after the minimum pool of GPU actors fits
+on the cluster (within ``--startup-timeout``) and the model loads on it.
 """
 
 import argparse
@@ -23,7 +26,14 @@ from collections.abc import Sequence
 import ray
 
 from mcap_lancedb import CAMERA_CHANNELS, DEFAULT_MODEL
-from mcap_lancedb.pipeline import WORKER_ENV, IngestConfig, configure_logging, run
+from mcap_lancedb.cli import non_negative_float, positive_float, positive_int
+from mcap_lancedb.pipeline import (
+    DEFAULT_STARTUP_TIMEOUT_S,
+    WORKER_ENV,
+    IngestConfig,
+    configure_logging,
+    run,
+)
 
 logger = logging.getLogger("ingest_on_cluster")
 
@@ -80,27 +90,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--channels", nargs="+", choices=CAMERA_CHANNELS, default=list(CAMERA_CHANNELS)
     )
-    parser.add_argument("--limit", type=int, help="Ingest only the first N frames.")
     parser.add_argument(
-        "--batch-size", type=int, default=64, help="Frames per embedding batch."
+        "--limit", type=positive_int, help="Ingest only the first N frames."
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=positive_int,
+        default=64,
+        help="Frames per embedding batch.",
     )
     parser.add_argument(
         "--min-gpu-actors",
-        type=int,
+        type=positive_int,
         default=1,
         help="Embedding actors to keep running.",
     )
     parser.add_argument(
         "--max-gpu-actors",
-        type=int,
+        type=positive_int,
         help="Most embedding actors to scale up to. Default: the GPUs the "
         "cluster has when the job starts.",
     )
     parser.add_argument(
         "--gpus-per-actor",
-        type=float,
+        type=non_negative_float,
         default=1.0,
         help="GPUs each actor reserves; 0.5 packs two actors per GPU, 0 runs on CPU.",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=positive_float,
+        default=DEFAULT_STARTUP_TIMEOUT_S,
+        help="Seconds to wait for --min-gpu-actors to fit, including autoscaling, "
+        "before giving up with any existing table unchanged.",
     )
     parser.add_argument(
         "--ray-address",
@@ -112,8 +134,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--vector-index", choices=["auto", "always", "never"], default="auto"
     )
     args = parser.parse_args(argv)
-    if args.min_gpu_actors < 1:
-        parser.error("--min-gpu-actors must be at least 1")
     if args.max_gpu_actors is not None and args.max_gpu_actors < args.min_gpu_actors:
         parser.error("--max-gpu-actors must be at least --min-gpu-actors")
     return args
@@ -154,6 +174,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             embed_actors=(args.min_gpu_actors, max_actors),
             gpus_per_actor=args.gpus_per_actor,
             vector_index=args.vector_index,
+            startup_timeout_s=args.startup_timeout,
         )
     )
 

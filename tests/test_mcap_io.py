@@ -117,6 +117,19 @@ def test_build_frame_records_limit_is_a_stable_prefix(
     assert [r["frame_id"] for r in limited] == [r["frame_id"] for r in full[:5]]
 
 
+def test_read_scene_counts_a_repeated_channel_once(
+    synthetic_mcap: SyntheticMcap,
+) -> None:
+    """``--channels CAM_FRONT CAM_FRONT`` doesn't write each frame twice."""
+    path = synthetic_mcap.root / "nuscenes-scene-0001.mcap"
+    with path.open("rb") as handle:
+        once = read_scene(handle, path.name, ["CAM_FRONT"])
+    with path.open("rb") as handle:
+        repeated = read_scene(handle, path.name, ["CAM_FRONT", "CAM_FRONT"])
+    assert [r["frame_id"] for r in repeated] == [r["frame_id"] for r in once]
+    assert len(once) == 3
+
+
 def test_read_scene_rejects_files_without_scene_info(tmp_path: Path) -> None:
     """An MCAP file nuscenes2mcap didn't write fails with a clear message."""
     path = tmp_path / "other.mcap"
