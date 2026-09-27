@@ -32,6 +32,7 @@ from typing import Any
 import lancedb
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.fs as pafs
 import ray
 import torch
@@ -203,6 +204,29 @@ def read_metadata(
     tables = ray.get([_read_scene_task.remote(filesystem, p, channels) for p in files])
     metadata = pa.concat_tables([METADATA_SCHEMA.empty_table(), *tables])
     return metadata if limit is None else metadata.slice(0, limit)
+
+
+def check_one_file_per_scene(metadata: pa.Table) -> None:
+    """Refuse a scene whose frames come from more than one MCAP file.
+
+    They would be written twice under the same frame_ids, which dedup merges
+    on and the viewer looks frames up by. nuscenes2mcap names each file after
+    its scene, so only a renamed or copied file does this.
+
+    Args:
+        metadata: Output of ``read_metadata``.
+
+    Raises:
+        ValueError: If any scene appears in two or more files.
+    """
+    files = metadata.group_by("scene_name").aggregate(
+        [("source_path", "count_distinct")]
+    )
+    repeated = files.filter(pc.field("source_path_count_distinct") > 1)
+    if repeated.num_rows:
+        names = ", ".join(sorted(repeated["scene_name"].to_pylist()))
+        msg = f"Scenes in more than one MCAP file: {names}. Keep one file per scene."
+        raise ValueError(msg)
 
 
 @functools.cache
@@ -493,6 +517,7 @@ def run(config: IngestConfig) -> int:
 
     Raises:
         FileNotFoundError: If there are no MCAP files or no camera keyframes.
+        ValueError: If a scene appears in more than one MCAP file.
         RuntimeError: If the embedding actors can't start. An existing table
             is left as it was.
     """
@@ -504,6 +529,7 @@ def run(config: IngestConfig) -> int:
     if metadata.num_rows == 0:
         msg = f"No camera keyframes in the MCAP files under {config.mcap_uri}"
         raise FileNotFoundError(msg)
+    check_one_file_per_scene(metadata)
     # With a limit, only read the files that hold the chosen frames.
     wanted = set(metadata["source_path"].to_pylist())
     files = [path for path in files if posixpath.basename(path) in wanted]

@@ -318,6 +318,7 @@ node.
 | --- | --- |
 | `No .mcap files in ...` | Run step 3, or point `--mcap-dir` at the converted scenes. |
 | `... has no scene-info metadata` | The file wasn't written by nuscenes2mcap. Keep only its output in `--mcap-dir`. |
+| `Scenes in more than one MCAP file: ...` | Two files hold the same scene, such as a renamed copy. Keep one file per scene in `--mcap-dir`. |
 | Ray warns the runtime_env package is "approaching the maximum upload size" | Under `uv run`, Ray uploads the current directory to its workers, minus anything in `.gitignore`. Run from the repository root, and keep datasets in `data/` or outside the repo. |
 | Out of memory while embedding | Lower `--batch-size`, or use the base model. |
 | `The cluster couldn't fit N embedding actor(s) ...` | The cluster lacks `--min-gpu-actors` × `--gpus-per-actor` GPUs. Lower either, add GPU nodes, or raise `--startup-timeout` if an autoscaler needs longer. The existing table is untouched. |

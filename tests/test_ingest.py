@@ -2,6 +2,7 @@
 
 import io
 import runpy
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from mcap_lancedb.mcap_io import build_frame_records, image_topic, read_scene
 from mcap_lancedb.pipeline import (
     EmbedFrames,
     IngestConfig,
+    check_one_file_per_scene,
     create_indexes,
     decode_frames,
     load_encoder_device,
@@ -260,6 +262,21 @@ def test_load_encoder_device_reports_where_the_model_runs(
 ) -> None:
     """The pre-flight load runs in a Ray worker; this covers it in-process."""
     assert load_encoder_device(DEFAULT_MODEL, None) == str(shared_encoder.device)
+
+
+def test_a_scene_in_two_files_is_refused(
+    synthetic_mcap: SyntheticMcap, tmp_path: Path
+) -> None:
+    """A copied scene file would write each of its frames twice, under one id."""
+    source = synthetic_mcap.root / "nuscenes-scene-0001.mcap"
+    for name in ("nuscenes-scene-0001.mcap", "nuscenes-scene-0001-copy.mcap"):
+        shutil.copy(source, tmp_path / name)
+    copied = pa.Table.from_pylist(build_frame_records(tmp_path), schema=METADATA_SCHEMA)
+    with pytest.raises(ValueError, match="scene-0001"):
+        check_one_file_per_scene(copied)
+
+    distinct = build_frame_records(synthetic_mcap.root)
+    check_one_file_per_scene(pa.Table.from_pylist(distinct, schema=METADATA_SCHEMA))
 
 
 def test_pipeline_without_mcap_files_raises(tmp_path: Path) -> None:
