@@ -387,42 +387,14 @@ flowchart TB
 
 ## Schema
 
-One table, `frames`, with one row per camera keyframe.
+One table, `frames`, holds one row per camera keyframe: IDs and provenance,
+scene context, camera calibration, ego pose and speed, the objects in view, a
+thumbnail and the original JPEG, and the SigLIP 2 embedding. Dedup adds each
+frame's nearest neighbors and `dup_of`. Table-level metadata records the
+embedding model, so the viewer always embeds queries with it.
 
-| Group | Columns |
-| --- | --- |
-| IDs and provenance | `frame_id` (scene/channel/capture time in µs), `scene_name`, `source_path` (the scene's MCAP file), `mcap_log_time` (the image message's log time, ns) |
-| Scene context | `scene_description`, `scene_tags`, `is_night`, `is_rain`, `location`, `log_date`, `vehicle` |
-| Camera | `channel`, `timestamp` (capture time, µs, UTC), `frame_index`, `width`, `height`, `cam_intrinsic` (9 × float32) |
-| Ego | `ego_translation` (3 × float64), `ego_rotation` ([w, x, y, z]), `ego_speed_mps` |
-| Objects in this camera | `visible_categories`, `num_visible_objects`, `num_pedestrians`, `num_cyclists`, `num_vehicles` |
-| Media | `thumbnail` (inline JPEG, 320 px long edge, q85), `image` (original JPEG bytes, `large_binary`) |
-| Embedding | `embedding` (`fixed_size_list<float32, D>`, L2-normalized) |
-| Dedup, merged later | `nn_frame_ids`, `nn_similarity` (top-k neighbors), `dup_of` (null means kept) |
-
-Table-level schema metadata records the embedding model, its dimension, and,
-after dedup, the threshold and k. The viewer embeds text queries with the model
-named there, so queries and frames always share a space.
-
-Why it looks like this:
-
-- **Fully denormalized.** LanceDB has no joins, so scene, pose and calibration
-  data are copied onto every frame. A filter like "night frames at
-  singapore-hollandvillage with two or more pedestrians" is one prefilter on
-  one table.
-- **Originals inline, but never read by accident.** `image` is a plain
-  `large_binary` column. Lance reads only the columns a query projects, so
-  searches and scans that leave it out (all of them, apart from the
-  full-resolution view) never pay for it. Grids read the small `thumbnail`
-  column instead.
-- **Near-duplicates are marked, never deleted.** Dedup only adds columns, so
-  "hide near-duplicates" is just `dup_of IS NULL`, and the viewer can re-run
-  suppression at any threshold from the stored graph.
-- **The vector index is conditional.** Below 100k rows an exact search is faster
-  than IVF_PQ and has perfect recall, so `--vector-index auto` skips it. Scalar
-  indexes always exist: BITMAP on `channel` and `location`, BTREE on
-  `scene_name` and on `frame_id`, which is the merge key and the viewer's
-  point-lookup key.
+[SCHEMAS.md](SCHEMAS.md) describes every column, the table metadata and the
+indexes, and explains why the table is laid out this way.
 
 ## Near-duplicate removal
 
